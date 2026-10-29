@@ -1,0 +1,27 @@
+{
+  "name": "Test path lukas",
+  "slug": "test-path-lukas",
+  "language": "en-GB",
+  "isPublic": false,
+  "model": "laerbeekbos",
+  "modelConfidence": 0.5,
+  "returnMasks": false,
+  "sendMQTT": true,
+  "headingFeedbackFps": 1,
+  "arrivalRadiusMeters": 3,
+  "routeLengthMeters": 87.2,
+  "pointCount": 9,
+  "updatedAt": "2026-10-29T12:32:40.215Z",
+  "arucoMarkers": [],
+  "points": [
+    {"id": "point-1790862243526-303ac3", "lat": 50.841334, "lng": 4.324271, "lon": 4.324271, "instruction": "Start here and continue to the next point."},
+    {"id": "point-1790862263850-2dab6f", "lat": 50.841262, "lng": 4.324406, "lon": 4.324406, "instruction": "Turn right at the next junction."},
+    {"id": "point-1790862281670-c8c392", "lat": 50.8412, "lng": 4.324302, "lon": 4.324302, "instruction": "Turn right at the next junction."},
+    {"id": "point-1790862301568-214ab3", "lat": 50.841213, "lng": 4.324243, "lon": 4.324243, "instruction": "Turn left at the next junction."},
+    {"id": "point-1790862318905-1b0a13", "lat": 50.841182, "lng": 4.324202, "lon": 4.324202, "instruction": "Turn left at the next junction."},
+    {"id": "point-1790862338753-4a5f6d", "lat": 50.841122, "lng": 4.324374, "lon": 4.324374, "instruction": "Turn right at the next junction."},
+    {"id": "point-1790862353820-a1f846", "lat": 50.841089, "lng": 4.324313, "lon": 4.324313, "instruction": "Turn right at the next junction."},
+    {"id": "point-1790862375444-c90fec", "lat": 50.841222, "lng": 4.324089, "lon": 4.324089, "instruction": "Turn right at the next junction."},
+    {"id": "point-1790862402217-fb7ce1", "lat": 50.841315, "lng": 4.324241, "lon": 4.324241, "instruction": "You have reached the destination."}
+  ]
+}

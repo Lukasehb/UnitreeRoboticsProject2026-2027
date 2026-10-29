@@ -4,8 +4,10 @@ import base64
 import json
 import os
 import re
+import math
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -392,6 +394,147 @@ DEFAULT_PREFERENCES = {
     "course_tolerance_deg": 5.0,
 }
 
+
+# --------------------------------------------------------------------------- #
+# Routes (JSON-bestanden in stayontrails/paths/) en de GPS van de gsm.
+# De gsm draait de pagina en zit op/bij de Unitree: zijn GPS-fix is dus de
+# positie van de robot. De pagina stuurt die elke seconde naar /api/gps.
+# --------------------------------------------------------------------------- #
+
+PATHS_DIR = Path(os.environ.get("PATHS_DIR") or (HERE / "paths"))
+PATHS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value).strip().lower()).strip("-")
+    return slug or "path"
+
+
+def normalize_path(doc: dict) -> dict:
+    """Valideer een route-JSON en vul lon/lng en tellers aan."""
+    if not isinstance(doc, dict):
+        raise ValueError("JSON moet een object zijn")
+    points = []
+    for index, raw in enumerate(doc.get("points") or []):
+        try:
+            lat = float(raw["lat"])
+            lng = float(raw.get("lng", raw.get("lon")))
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"punt {index + 1} heeft geen geldige lat/lng")
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            raise ValueError(f"punt {index + 1} ligt buiten het geldige bereik")
+        points.append({
+            **raw,
+            "id": raw.get("id") or f"point-{index + 1}",
+            "lat": lat, "lng": lng, "lon": lng,
+            "instruction": str(raw.get("instruction") or ""),
+        })
+    if not points:
+        raise ValueError("de route bevat geen punten")
+    doc = dict(doc)
+    doc["slug"] = slugify(doc.get("slug") or doc.get("name") or "path")
+    doc["name"] = doc.get("name") or doc["slug"]
+    doc["points"] = points
+    doc["pointCount"] = len(points)
+    return doc
+
+
+def load_path_file(slug: str) -> dict | None:
+    file = PATHS_DIR / f"{slugify(slug)}.json"
+    if not file.is_file():
+        return None
+    return normalize_path(json.loads(file.read_text(encoding="utf-8-sig")))
+
+
+def list_path_files() -> list[dict]:
+    items = []
+    for file in sorted(PATHS_DIR.glob("*.json")):
+        try:
+            doc = normalize_path(json.loads(file.read_text(encoding="utf-8-sig")))
+        except (OSError, ValueError):
+            continue
+        items.append({"slug": doc["slug"], "name": doc["name"], "pointCount": doc["pointCount"],
+                      "routeLengthMeters": doc.get("routeLengthMeters")})
+    return items
+
+
+def haversine_m(lat1, lon1, lat2, lon2) -> float:
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def bearing_deg(lat1, lon1, lat2, lon2) -> float:
+    """Kompasrichting (0 = noord, 90 = oost) van punt 1 naar punt 2."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+GPS_LOCK = threading.Lock()
+GPS_STATE: dict[str, Any] = {}
+GPS_MAX_AGE_S = 5.0     # ouder dan dit geldt de fix als verlopen
+GPS_MAX_ACCURACY_M = 15.0
+
+
+def update_gps(payload: dict) -> bool:
+    try:
+        lat = float(payload["latitude"])
+        lon = float(payload["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return False
+    acc = payload.get("gps_accuracy")
+    with GPS_LOCK:
+        GPS_STATE.update({
+            "lat": lat, "lon": lon,
+            "accuracy_m": float(acc) if acc is not None else None,
+            "slug": payload.get("slug") or GPS_STATE.get("slug"),
+            "active_point": payload.get("active_point"),
+            "received_at": time.time(),
+        })
+    return True
+
+
+def gps_snapshot() -> dict:
+    with GPS_LOCK:
+        state = dict(GPS_STATE)
+    if not state:
+        return {"ok": True, "fix": False, "reason": "nog geen GPS ontvangen van de gsm"}
+    age = time.time() - state["received_at"]
+    out = {
+        "ok": True,
+        "fix": age <= GPS_MAX_AGE_S,
+        "lat": state["lat"], "lon": state["lon"],
+        "accuracy_m": state["accuracy_m"],
+        "age_s": round(age, 2),
+        "reliable": age <= GPS_MAX_AGE_S and (state["accuracy_m"] is None or state["accuracy_m"] <= GPS_MAX_ACCURACY_M),
+    }
+    # Voortgang op de route: afstand en kompasrichting naar het actieve punt
+    try:
+        doc = load_path_file(state["slug"]) if state.get("slug") else None
+    except (OSError, ValueError):
+        doc = None
+    idx = state.get("active_point")
+    if doc and isinstance(idx, int) and 0 <= idx < len(doc["points"]):
+        target = doc["points"][idx]
+        out["route"] = {
+            "slug": doc["slug"],
+            "active_point": idx,
+            "point_count": len(doc["points"]),
+            "target": {"lat": target["lat"], "lon": target["lng"], "instruction": target["instruction"]},
+            "distance_m": round(haversine_m(state["lat"], state["lon"], target["lat"], target["lng"]), 2),
+            "bearing_deg": round(bearing_deg(state["lat"], state["lon"], target["lat"], target["lng"]), 1),
+            "arrival_radius_m": doc.get("arrivalRadiusMeters", 3),
+        }
+    return out
+
+
 # Stand-in for the missing sot_render_menu() PHP helper.
 MENU_HTML = (
     '<h1 class="brand">Stay On Trails</h1>'
@@ -582,6 +725,22 @@ TRANSPORT_OVERRIDE_SCRIPT = r'''<script>
       renderTrailDirection();
     }
   }
+
+  // GPS van de gsm doorsturen: dit is de positie van de Unitree.
+  setInterval(() => {
+    if (latestLatitude === null || latestLongitude === null) return;
+    fetch("/api/gps", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        latitude: latestLatitude,
+        longitude: latestLongitude,
+        gps_accuracy: latestAccuracy,
+        slug: currentPath ? currentPath.slug : null,
+        active_point: walkingActive ? activePointIndex : null
+      })
+    }).catch(() => {});
+  }, 1000);
 </script>
 '''.replace("__SEGMENT_ENDPOINT__", SEGMENT_ENDPOINT)
 
@@ -630,10 +789,18 @@ def render_freewalk_page() -> str:
 def index():
     action = request.args.get("action")
     if action == "list_paths":
-        # No route database in this standalone app; free walking needs no saved paths.
-        return jsonify({"ok": True, "paths": []})
+        return jsonify({"ok": True, "paths": list_path_files()})
     if action == "load_path":
-        return jsonify({"ok": False, "error": "Path not found."}), 404
+        slug = request.args.get("slug", "")
+        if not slug:
+            return jsonify({"ok": False, "error": "Missing path slug."}), 400
+        try:
+            doc = load_path_file(slug)
+        except (OSError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        if doc is None:
+            return jsonify({"ok": False, "error": "Path not found."}), 404
+        return jsonify({"ok": True, "path": doc})
     if action:
         return jsonify({"ok": False, "error": "Unknown action."}), 404
 
@@ -649,6 +816,33 @@ def health():
     return jsonify({"ok": True, "models": MODEL_ORDER, "default_model": DEFAULT_MODEL_NAME})
 
 
+
+@app.post("/api/paths")
+def upload_path():
+    """Route-JSON (zoals uit de stayontrails-editor) op de Jetson zetten."""
+    doc = request.get_json(silent=True)
+    try:
+        doc = normalize_path(doc)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    (PATHS_DIR / f"{doc['slug']}.json").write_text(
+        json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
+    return jsonify({"ok": True, "slug": doc["slug"], "pointCount": doc["pointCount"]})
+
+
+@app.post("/api/gps")
+def post_gps():
+    """De pagina op de gsm meldt zijn GPS-fix."""
+    if not update_gps(request.get_json(silent=True) or {}):
+        return jsonify({"ok": False, "error": "latitude/longitude ontbreken of zijn ongeldig"}), 400
+    return jsonify({"ok": True})
+
+
+@app.get("/api/gps")
+def get_gps():
+    """Laatste positie van de Unitree (= gsm), plus afstand/richting naar het actieve routepunt."""
+    return jsonify(gps_snapshot())
+
 @app.post("/api/freewalk/segment")
 def segment():
     try:
@@ -658,6 +852,7 @@ def segment():
         return jsonify({"ok": False, "error": str(exc)}), 400
 
     payload = request.get_json(silent=True) or {}
+    update_gps(payload)
     model_name = payload.get("model", DEFAULT_MODEL_NAME)
     detection_confidence = parse_detection_confidence(payload, 0.8)
     return_masks = bool(payload.get("returnMasks", False))

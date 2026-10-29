@@ -14,8 +14,11 @@ import logging
 import math
 import os
 import random
+import ssl
 import threading
 import time
+import urllib.parse
+import urllib.request
 
 from flask import Flask, Response, jsonify, render_template_string, request
 
@@ -127,6 +130,20 @@ TURN_DIRECTIONS = ("links", "rechts")
 MAX_TURN_SECONDS = 10.0       # grens op de duur van een draai
 MAX_RULE_DISTANCE = 10.0      # grens op de afstand waarop een regel afgaat
 
+# Een route volgen met de GPS van de gsm (zie stayontrails/freewalkFlask.py).
+# De gsm zit op/bij de robot en draait de stayontrails-pagina; die stuurt zijn
+# GPS naar /api/gps. De camera blijft het pad volgen, de GPS beslist wanneer
+# een routepunt bereikt is en of we nog de goede kant op lopen.
+FREEWALK_URL = os.environ.get("FREEWALK_URL", "https://localhost:5003")
+ROUTE_POLL_INTERVAL = 1.0     # s tussen twee GPS-uitlezingen
+ROUTE_GPS_MAX_AGE = 5.0       # s zonder verse GPS voor we stoppen
+ROUTE_MAX_ACCURACY = 15.0     # m: slechtere fixes tellen niet mee voor aankomst
+ROUTE_MIN_COURSE_M = 3.0      # m verplaatsing nodig om de looprichting te schatten
+ROUTE_GPS_STEERING = True     # bijsturen als de looprichting ver van het volgende punt wijkt
+ROUTE_TURN_THRESHOLD = 50.0   # graden afwijking waarboven we bijsturen
+ROUTE_MAX_CORRECTION = 90.0   # nooit meer dan dit in één correctie draaien
+ROUTE_CORRECTION_COOLDOWN = 10.0  # s tussen twee correcties
+
 # Het pad volgen: dit loopt door tot er iets is om voor te stoppen
 FOLLOW_DEADBAND = 3.0         # graden verschil waarbinnen we niet bijsturen
 FOLLOW_FULL_TURN = 90.0       # graden verschil waarbij we op volle bijstuursnelheid zitten
@@ -211,6 +228,7 @@ class RobotController:
         # Een ander commando betekent dat je zelf de leiding neemt
         if command != "follow":
             path_follower.stop("commando " + command)
+            route_follower.stop("commando " + command)
 
         self.note_command(command)
         return COMMANDS[command]()
@@ -1817,6 +1835,247 @@ class PathFollower:
 
 path_follower = PathFollower()
 
+# ------------------------------------------------------------- route via GPS
+
+def freewalk_get(path, timeout=3):
+    """JSON ophalen bij de stayontrails-app (zelfondertekend certificaat)."""
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(FREEWALK_URL.rstrip("/") + path,
+                                timeout=timeout, context=context) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = (math.sin((p2 - p1) / 2) ** 2 +
+         math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2)
+    return 2 * 6371000.0 * math.asin(math.sqrt(a))
+
+
+def bearing_deg(lat1, lon1, lat2, lon2):
+    """Kompasrichting (0 = noord, 90 = oost) van punt 1 naar punt 2."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def angle_diff(target, current):
+    """Kleinste hoek van current naar target, -180..180 (positief = rechts)."""
+    return (target - current + 180) % 360 - 180
+
+
+class RouteFollower:
+    """Loopt een route uit stayontrails af met de GPS van de gsm.
+
+    De camera-volger (path_follower) blijft het pad volgen; deze klasse houdt
+    de GPS in het oog: ze zet het actieve routepunt door als we binnen de
+    aankomststraal komen, stopt aan het einde of als de GPS wegvalt, en stuurt
+    bij als de gelopen richting duidelijk niet naar het volgende punt wijst.
+    Elk ander commando, een noodstop of het stoppen van de camera-volger zet
+    de route ook stil."""
+
+    def __init__(self):
+        self._thread = None
+        self._stop = threading.Event()
+        self.active = False
+        self.reason = None
+        self.changes = 0
+        self.slug = None
+        self.name = None
+        self.points = []
+        self.radius = 3.0
+        self.index = 0
+        self.distance = None
+        self.bearing = None
+        self.course = None
+        self.accuracy = None
+        self._track = []              # (monotonic, lat, lon) sinds de laatste correctie
+        self._last_correction = 0.0
+
+    # -- starten en stoppen --------------------------------------------------
+
+    def start(self, slug):
+        if self.active:
+            return {"ok": False, "error": "er loopt al een route"}
+        if not robot.connected:
+            return {"ok": False, "error": "geen verbinding met de robot"}
+
+        try:
+            payload = freewalk_get("/?action=load_path&slug=" + urllib.parse.quote(slug))
+        except Exception as exc:
+            return {"ok": False, "error": "route laden mislukt: %s" % exc}
+        if not payload.get("ok"):
+            return {"ok": False, "error": payload.get("error", "route niet gevonden")}
+
+        path = payload["path"]
+        points = [(float(p["lat"]), float(p["lng"]), p.get("instruction", ""))
+                  for p in path.get("points", [])]
+        if len(points) < 2:
+            return {"ok": False, "error": "de route heeft te weinig punten"}
+
+        gps = self._gps()
+        if gps is None:
+            return {"ok": False, "error": "geen verse GPS van de gsm: open de stayontrails-pagina"}
+
+        self.slug = path.get("slug", slug)
+        self.name = path.get("name", slug)
+        self.points = points
+        self.radius = float(path.get("arrivalRadiusMeters") or 3)
+        self.index = 0
+        self.distance = self.bearing = self.course = None
+        self._track = []
+        self._last_correction = 0.0
+        self.reason = None
+        self.active = True
+        self.changes += 1
+        self._stop.clear()
+
+        path_follower.start()         # de camera loopt mee op het pad
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        print("Route gestart: %s (%d punten)" % (self.name, len(points)), flush=True)
+        return {"ok": True, "route": self.name, "points": len(points)}
+
+    def stop(self, reason):
+        if not self.active:
+            return
+        self.active = False
+        self.reason = reason
+        self.changes += 1
+        self._stop.set()
+        print("Route gestopt: " + reason, flush=True)
+        path_follower.stop("route: " + reason)
+
+    # -- GPS -----------------------------------------------------------------
+
+    def _gps(self):
+        """De verse GPS van de gsm, of None."""
+        try:
+            data = freewalk_get("/api/gps")
+        except Exception:
+            return None
+        if not data.get("fix") or data.get("age_s", 99) > ROUTE_GPS_MAX_AGE:
+            return None
+        return data
+
+    # -- lus -----------------------------------------------------------------
+
+    def _run(self):
+        gps_lost_since = None
+        try:
+            while not self._stop.is_set():
+                reason = self._reason_to_stop()
+                if reason is not None:
+                    self.stop(reason)
+                    return
+
+                gps = self._gps()
+                if gps is None:
+                    gps_lost_since = gps_lost_since or time.monotonic()
+                    if time.monotonic() - gps_lost_since > ROUTE_GPS_MAX_AGE:
+                        self.stop("GPS weggevallen")
+                        return
+                else:
+                    gps_lost_since = None
+                    self._update(gps)
+
+                self._stop.wait(ROUTE_POLL_INTERVAL)
+        except Exception as exc:
+            self.stop("fout: " + str(exc))
+
+    def _reason_to_stop(self):
+        if robot.stopped:
+            return "noodstop"
+        if not robot.connected:
+            return "geen verbinding"
+        # Het volgen stond even stil voor een draairegel? Dan wachten we.
+        if not path_follower.active and path_follower.reason != "draairegel":
+            return "camera-volger gestopt (%s)" % path_follower.reason
+        return None
+
+    def _update(self, gps):
+        lat, lon = gps["lat"], gps["lon"]
+        self.accuracy = gps.get("accuracy_m")
+        target_lat, target_lon, _ = self.points[self.index]
+        self.distance = haversine_m(lat, lon, target_lat, target_lon)
+        self.bearing = bearing_deg(lat, lon, target_lat, target_lon)
+
+        reliable = self.accuracy is None or self.accuracy <= ROUTE_MAX_ACCURACY
+        if reliable and self.distance <= self.radius:
+            self.index += 1
+            self.changes += 1
+            self._track = []
+            self.course = None
+            print("Routepunt %d bereikt" % self.index, flush=True)
+            if self.index >= len(self.points):
+                self.stop("bestemming bereikt")
+                robot.note_command("route klaar")
+                try:
+                    robot.move(x=0, y=0, z=0)
+                except Exception:
+                    pass
+            return
+
+        if reliable:
+            self._track.append((time.monotonic(), lat, lon))
+            self._track = self._track[-30:]
+        self._steer()
+
+    def _steer(self):
+        """Bijsturen als we al een tijd de verkeerde kant op lopen."""
+        if not ROUTE_GPS_STEERING or len(self._track) < 2:
+            return
+        _, lat0, lon0 = self._track[0]
+        _, lat1, lon1 = self._track[-1]
+        if haversine_m(lat0, lon0, lat1, lon1) < ROUTE_MIN_COURSE_M:
+            return                      # te weinig verplaatst: GPS-ruis
+
+        self.course = bearing_deg(lat0, lon0, lat1, lon1)
+        error = angle_diff(self.bearing, self.course)
+        if abs(error) < ROUTE_TURN_THRESHOLD:
+            return
+        if time.monotonic() - self._last_correction < ROUTE_CORRECTION_COOLDOWN:
+            return
+
+        degrees = clamp(error, -ROUTE_MAX_CORRECTION, ROUTE_MAX_CORRECTION)
+        print("Route: koers %.0f, doel %.0f, stuur %+.0f graden bij" %
+              (self.course, self.bearing, degrees), flush=True)
+        self._last_correction = time.monotonic()
+        self._track = []                # opnieuw een looprichting opbouwen
+        self.course = None
+
+        # Even de camera-volger stilzetten, draaien, en weer aanzetten
+        resume = path_follower.pause_for_turn()
+        try:
+            robot.follow_heading(degrees)
+        finally:
+            if resume and self.active and not robot.stopped:
+                path_follower.start()
+
+    # -- voor de webpagina ---------------------------------------------------
+
+    def snapshot(self):
+        return {
+            "active": self.active,
+            "reason": self.reason,
+            "changes": self.changes,
+            "name": self.name,
+            "point": min(self.index + 1, len(self.points)) if self.points else None,
+            "points": len(self.points),
+            "distance": None if self.distance is None else round(self.distance, 1),
+            "bearing": None if self.bearing is None else round(self.bearing),
+            "course": None if self.course is None else round(self.course),
+            "accuracy": self.accuracy,
+        }
+
+
+route_follower = RouteFollower()
+
+
 
 # -------------------------------------------------------------- commandotabel
 
@@ -2130,6 +2389,15 @@ HTML_PAGE = """
 </section>
 
 <section>
+  <h2>Route (GPS)</h2>
+  <div class="row">
+    <select id="route-select"></select>
+    <button id="route-go"><span class="ico">🗺️</span><span class="lbl">volg route</span></button>
+  </div>
+  <div id="route-info">—</div>
+</section>
+
+<section>
   <h2>Houding</h2>
   <div class="grid cols-2">
     <button data-cmd="stand_up"><span class="ico">🦮</span><span class="lbl">opstaan</span></button>
@@ -2324,6 +2592,55 @@ followButton.addEventListener('click', () => {
 
 showForwardMode();
 
+// ---- route volgen met de GPS van de gsm
+const routeSelect = document.getElementById('route-select');
+const routeGo = document.getElementById('route-go');
+const routeInfo = document.getElementById('route-info');
+let routeActive = false;
+let lastRouteChanges = null;
+
+async function loadRoutes() {
+  try {
+    const res = await fetch('/route/paths');
+    const data = await res.json();
+    routeSelect.innerHTML = '';
+    (data.paths || []).forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.slug;
+      opt.textContent = p.name + ' (' + p.pointCount + ')';
+      routeSelect.appendChild(opt);
+    });
+    if (!data.ok) routeInfo.textContent = data.error;
+    else if (!(data.paths || []).length) routeInfo.textContent = 'geen routes gevonden';
+  } catch (e) {
+    routeInfo.textContent = 'routes laden mislukt';
+  }
+}
+loadRoutes();
+
+routeGo.addEventListener('click', async () => {
+  const url = routeActive ? '/route/stop' : '/route/start?slug=' + encodeURIComponent(routeSelect.value);
+  if (!routeActive && !routeSelect.value) return;
+  const res = await fetch(url, { method: 'POST' });
+  const data = await res.json();
+  if (!data.ok) setStatus(data.error, 'err');
+});
+
+function showRoute(r) {
+  if (!r) return;
+  routeActive = !!r.active;
+  routeGo.querySelector('.lbl').textContent = routeActive ? 'stop route' : 'volg route';
+  routeGo.classList.toggle('bezig', routeActive);
+  if (routeActive) {
+    routeInfo.textContent = r.name + ' — punt ' + r.point + '/' + r.points +
+      (r.distance !== null ? ', nog ' + r.distance + ' m' : '') +
+      (r.accuracy ? ' (GPS ±' + Math.round(r.accuracy) + ' m)' : '');
+  } else if (r.reason) {
+    routeInfo.textContent = 'route gestopt: ' + r.reason;
+  }
+  lastRouteChanges = r.changes;
+}
+
 function showFollowing(data) {
   following = !!data.following;
   showForwardMode();
@@ -2517,6 +2834,7 @@ async function poll() {
     showMarkerCommand(data.camera);
     showPhotos(data.photos);
     showFollowing(data);
+    showRoute(data.route);
   } catch (err) {
     setStatus('server onbereikbaar', 'err');
   }
@@ -2833,7 +3151,35 @@ def status():
         "following": path_follower.active,
         "follow_reason": path_follower.reason,
         "follow_changes": path_follower.changes,
+        "route": route_follower.snapshot(),
     })
+
+
+@app.route("/route/paths")
+def route_paths():
+    """De routes die op de Jetson staan (uit de stayontrails-app)."""
+    try:
+        return jsonify(freewalk_get("/?action=list_paths"))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "stayontrails-app niet bereikbaar: %s" % exc,
+                        "paths": []}), 503
+
+
+@app.route("/route/start", methods=["POST", "GET"])
+def route_start():
+    slug = request.args.get("slug", "")
+    if not slug:
+        return jsonify({"ok": False, "error": "parameter 'slug' ontbreekt"}), 400
+    result = route_follower.start(slug)
+    return jsonify(result), (200 if result.get("ok") else 409)
+
+
+@app.route("/route/stop", methods=["POST", "GET"])
+def route_stop():
+    route_follower.stop("op de knop geklikt")
+    if robot.connected:
+        robot.move(x=0, y=0, z=0)
+    return jsonify({"ok": True})
 
 
 @app.route("/video")

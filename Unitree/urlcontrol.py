@@ -1917,6 +1917,17 @@ class RouteFollower:
         if len(points) < 2:
             return {"ok": False, "error": "de route heeft te weinig punten"}
 
+        # De camera-volger heeft een vers segmentatiebeeld nodig; zonder zou de
+        # route meteen stoppen met een vage melding. Zeg dus wat er schort.
+        camera = segmentation.snapshot()
+        if camera["status"] != "actief" or camera["age"] is None or camera["age"] > HEADING_MAX_AGE:
+            reason = {
+                "model laden": "het model wordt nog geladen, wacht even",
+                "wachten op beeld": "er komt geen camerabeeld van de robot binnen",
+                "fout": "segmentatiefout: %s" % camera["error"],
+            }.get(camera["status"], "geen vers camerabeeld (status: %s)" % camera["status"])
+            return {"ok": False, "error": "camera niet klaar: " + reason}
+
         gps = self._gps()
         if gps is None:
             return {"ok": False, "error": "geen verse GPS van de gsm: open de stayontrails-pagina"}

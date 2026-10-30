@@ -8,6 +8,7 @@ import math
 import socket
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -535,6 +536,32 @@ def gps_snapshot() -> dict:
     return out
 
 
+# Robotmodus: de gsm levert enkel GPS. De segmentatie loopt op het beeld van de
+# Unitree zelf (urlcontrol.py, poort 8080); de pagina toont dat beeld en
+# gebruikt de camera van de gsm niet. Zet FREEWALK_ROBOT_MODE=0 voor de
+# gewone wandelversie met de gsm-camera.
+ROBOT_MODE = os.environ.get("FREEWALK_ROBOT_MODE", "1").strip().lower() not in ("0", "false", "no", "off")
+ROBOT_URL = os.environ.get("ROBOT_URL", "http://localhost:8080").rstrip("/")
+
+ROBOT_MODE_SCRIPT = r'''<script>
+  // --- robotmodus: beeld van de Unitree, geen gsm-camera ---
+  async function startCamera() {
+    if (document.getElementById("robotVideo")) return;
+    const preview = document.getElementById("trailPreview");
+    if (preview) preview.style.display = "none";
+    trailVideoEl.style.display = "none";
+    const img = document.createElement("img");
+    img.id = "robotVideo";
+    img.className = "trailVideoBg";
+    img.style.opacity = "1";
+    img.alt = "Camera van de Unitree";
+    img.src = "/robot/video";
+    trailVideoEl.parentNode.insertBefore(img, trailVideoEl);
+  }
+  async function startOrientationTracking() {}   // helling van de gsm is hier niet relevant
+</script>
+'''
+
 # Stand-in for the missing sot_render_menu() PHP helper.
 MENU_HTML = (
     '<h1 class="brand">Stay On Trails</h1>'
@@ -782,6 +809,8 @@ def render_freewalk_page() -> str:
         source = source.replace("</body>", TRANSPORT_OVERRIDE_SCRIPT + "</body>", 1)
     else:
         source += TRANSPORT_OVERRIDE_SCRIPT
+    if ROBOT_MODE:
+        source = source.replace("</body>", ROBOT_MODE_SCRIPT + "</body>", 1)
     return source
 
 
@@ -809,6 +838,29 @@ def index():
     except FileNotFoundError:
         return jsonify({"ok": False, "error": f"source page not found: {FREEWALK_PHP.name}"}), 500
     return Response(html, mimetype="text/html; charset=utf-8")
+
+
+@app.get("/robot/video")
+def robot_video():
+    """Het live beeld van de Unitree (MJPEG van urlcontrol.py), via deze HTTPS-pagina
+    doorgegeven zodat de browser het niet als onveilige http-inhoud blokkeert."""
+    try:
+        upstream = urllib.request.urlopen(ROBOT_URL + "/video", timeout=5)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"robotbeeld niet bereikbaar: {exc}"}), 502
+
+    def relay():
+        try:
+            while True:
+                chunk = upstream.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            upstream.close()
+
+    return Response(relay(), mimetype=upstream.headers.get("Content-Type", "multipart/x-mixed-replace; boundary=frame"),
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/health")
@@ -1054,6 +1106,7 @@ if __name__ == "__main__":
         print("        Run ./setup-https.sh (mkcert) for a no-warning trusted cert.")
     elif scheme != "https":
         print("  Note: over plain http the camera only works via localhost (secure-context rule).")
+    print(f"Robotmodus: {'aan — beeld van ' + ROBOT_URL + '/video, geen gsm-camera' if ROBOT_MODE else 'uit — gsm-camera'}")
     print(f"Models found: {MODEL_ORDER or '(none — drop a .pt into the repo root or models/)'}")
 
     run_kwargs: dict[str, Any] = dict(host=host, port=port, debug=False, threaded=True)

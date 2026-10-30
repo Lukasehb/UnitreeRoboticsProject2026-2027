@@ -803,6 +803,11 @@ def render_freewalk_page() -> str:
     # Substitute the remaining inline <?php ... ?> tags (menu + config echoes).
     source = PHP_TAG_RE.sub(_replace_php_tag, source)
 
+    # Leaflet lokaal serveren (stayontrails/static/leaflet): het wifi van de robot
+    # heeft geen internet, dus unpkg.com is dan onbereikbaar. Kaarttegels (OSM)
+    # blijven online; zonder internet zie je een lege kaart met de route erop.
+    source = source.replace("https://unpkg.com/leaflet@1.9.4/dist/", "/static/leaflet/")
+
     # Append the HTTP transport override just before </body> so it shadows the
     # WebSocket implementation defined in the page's main script.
     if "</body>" in source:
@@ -952,15 +957,24 @@ KEY_PATH = HERE / "freewalk-key.pem"
 
 
 def detect_lan_ip() -> str:
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    """LAN-adres van deze machine. Override met FREEWALK_LAN_IP. We proberen
+    meerdere doelen: op het wifi van de robot (geen internet) werkt 8.8.8.8 niet."""
+    forced = (os.environ.get("FREEWALK_LAN_IP") or "").strip()
+    if forced:
+        return forced
+    for target in ("8.8.8.8", "192.168.12.1", "10.255.255.255"):
         try:
-            sock.connect(("8.8.8.8", 80))
-            return sock.getsockname()[0]
-        finally:
-            sock.close()
-    except OSError:
-        return "127.0.0.1"
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.connect((target, 80))
+                ip = sock.getsockname()[0]
+            finally:
+                sock.close()
+            if ip and not ip.startswith("127."):
+                return ip
+        except OSError:
+            continue
+    return "127.0.0.1"
 
 
 def detect_hostnames() -> list[str]:

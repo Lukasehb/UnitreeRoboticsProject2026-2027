@@ -1,0 +1,21 @@
+{
+  "name": "Unitree indoor test",
+  "slug": "unitree-indoor-test",
+  "language": "en-GB",
+  "isPublic": false,
+  "model": "unrealsim",
+  "modelConfidence": 0.5,
+  "returnMasks": false,
+  "sendMQTT": false,
+  "headingFeedbackFps": 1,
+  "arrivalRadiusMeters": 3,
+  "routeLengthMeters": 21.8,
+  "pointCount": 3,
+  "updatedAt": "2026-10-30T09:23:50.587Z",
+  "arucoMarkers": [],
+  "points": [
+    {"id": "point-1793282441530-d21817", "lat": 50.841746, "lng": 4.322936, "lon": 4.322936, "instruction": "Start"},
+    {"id": "point-1793282457945-e5bbe0", "lat": 50.841702, "lng": 4.323046, "lon": 4.323046, "instruction": "Turn right"},
+    {"id": "point-1793282477242-249737", "lat": 50.841719, "lng": 4.322868, "lon": 4.322868, "instruction": "Do 180"}
+  ]
+}

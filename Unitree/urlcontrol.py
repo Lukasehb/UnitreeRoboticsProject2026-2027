@@ -37,7 +37,7 @@ from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD, VUI_COLOR
 
 logging.basicConfig(level=logging.FATAL)
 
-ROBOT_IP = "192.168.12.1"
+ROBOT_IP = os.environ.get("ROBOT_IP", "10.2.172.215")   # of: ROBOT_IP=x.x.x.x python3 urlcontrol.py
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8080
 

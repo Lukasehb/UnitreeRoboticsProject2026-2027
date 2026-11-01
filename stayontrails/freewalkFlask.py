@@ -481,8 +481,23 @@ GPS_STATE: dict[str, Any] = {}
 GPS_MAX_AGE_S = 5.0     # ouder dan dit geldt de fix als verlopen
 GPS_MAX_ACCURACY_M = 15.0
 
+# Simulatormodus: de positie komt van de simulator (Unitree/simgo2.py, met
+# source "sim"), niet van de browser. De pagina meldt dan enkel nog welke route
+# en welk punt actief zijn, en haalt zijn positie zelf op bij /api/gps.
+SIM_GPS = os.environ.get("FREEWALK_SIM_GPS", "0").strip().lower() in ("1", "true", "yes", "on")
+
 
 def update_gps(payload: dict) -> bool:
+    route = {}
+    if payload.get("slug"):
+        route["slug"] = payload["slug"]
+    if "active_point" in payload:
+        route["active_point"] = payload["active_point"]
+    if SIM_GPS and payload.get("source") != "sim":
+        with GPS_LOCK:
+            GPS_STATE.update(route)
+        return True
+
     try:
         lat = float(payload["latitude"])
         lon = float(payload["longitude"])
@@ -495,9 +510,8 @@ def update_gps(payload: dict) -> bool:
         GPS_STATE.update({
             "lat": lat, "lon": lon,
             "accuracy_m": float(acc) if acc is not None else None,
-            "slug": payload.get("slug") or GPS_STATE.get("slug"),
-            "active_point": payload.get("active_point"),
             "received_at": time.time(),
+            **route,
         })
     return True
 
@@ -505,7 +519,7 @@ def update_gps(payload: dict) -> bool:
 def gps_snapshot() -> dict:
     with GPS_LOCK:
         state = dict(GPS_STATE)
-    if not state:
+    if "lat" not in state:
         return {"ok": True, "fix": False, "reason": "nog geen GPS ontvangen van de gsm"}
     age = time.time() - state["received_at"]
     out = {
@@ -559,6 +573,49 @@ ROBOT_MODE_SCRIPT = r'''<script>
     trailVideoEl.parentNode.insertBefore(img, trailVideoEl);
   }
   async function startOrientationTracking() {}   // helling van de gsm is hier niet relevant
+</script>
+'''
+
+# Simulatormodus: de positie op de kaart en voor de routebegeleiding komt van
+# de simulator (via /api/gps), niet van de GPS van dit toestel.
+SIM_GPS_SCRIPT = r'''<script>
+  // --- simulatormodus: GPS van de simulator in plaats van navigator.geolocation ---
+  function startLocationTracking() {
+    if (geoWatchId !== null) return;
+    gpsStatusEl.textContent = "GPS: wachten op de simulator";
+    geoWatchId = setInterval(async () => {
+      let gps;
+      try {
+        gps = await (await fetch("/api/gps", { cache: "no-store" })).json();
+      } catch {
+        return;
+      }
+      if (!gps || !gps.fix) {
+        gpsStatusEl.textContent = "GPS: geen positie van de simulator";
+        return;
+      }
+      latestLatitude = gps.lat;
+      latestLongitude = gps.lon;
+      latestAccuracy = gps.accuracy_m;
+      if (walkingActive) {
+        recordedTrack.push({ lat: gps.lat, lon: gps.lon, ele: null, time: new Date().toISOString() });
+        updateSaveGpxButton();
+      }
+      updateGpsUi();
+      maybeAdvanceRoute();
+    }, 1000);
+  }
+  function stopLocationTracking() {
+    if (geoWatchId !== null) {
+      clearInterval(geoWatchId);
+      geoWatchId = null;
+    }
+    walkingActive = false;
+    latestLatitude = null;
+    latestLongitude = null;
+    latestAccuracy = null;
+    updateGpsUi();
+  }
 </script>
 '''
 
@@ -816,6 +873,8 @@ def render_freewalk_page() -> str:
         source += TRANSPORT_OVERRIDE_SCRIPT
     if ROBOT_MODE:
         source = source.replace("</body>", ROBOT_MODE_SCRIPT + "</body>", 1)
+    if SIM_GPS:
+        source = source.replace("</body>", SIM_GPS_SCRIPT + "</body>", 1)
     return source
 
 
@@ -1121,6 +1180,7 @@ if __name__ == "__main__":
     elif scheme != "https":
         print("  Note: over plain http the camera only works via localhost (secure-context rule).")
     print(f"Robotmodus: {'aan — beeld van ' + ROBOT_URL + '/video, geen gsm-camera' if ROBOT_MODE else 'uit — gsm-camera'}")
+    print(f"GPS: {'van de simulator (FREEWALK_SIM_GPS=1)' if SIM_GPS else 'van de gsm'}")
     print(f"Models found: {MODEL_ORDER or '(none — drop a .pt into the repo root or models/)'}")
 
     run_kwargs: dict[str, Any] = dict(host=host, port=port, debug=False, threaded=True)

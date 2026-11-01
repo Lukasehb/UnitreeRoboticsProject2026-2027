@@ -38,6 +38,8 @@ from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD, VUI_COLOR
 logging.basicConfig(level=logging.FATAL)
 
 ROBOT_IP = os.environ.get("ROBOT_IP", "10.2.172.215")   # of: ROBOT_IP=x.x.x.x python3 urlcontrol.py
+# Sessiecode van de Botopia-simulator (zie simgo2.py). Leeg = de echte Go2.
+ROBOT_SIM = os.environ.get("ROBOT_SIM", "").strip()     # ROBOT_SIM=729AM9 python3 urlcontrol.py
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8080
 
@@ -3453,7 +3455,27 @@ def run_asyncio_loop(loop, ready):
             frame = await track.recv()
             segmentation.put_frame(frame.to_ndarray(format="bgr24"))
 
+    async def setup_sim():
+        # Zelfde berichten als de echte Go2, maar via de simulator; die levert
+        # ook het camerabeeld en (uit zijn pose) een nep-GPS voor stayontrails
+        import simgo2
+
+        conn = simgo2.SimConnection(ROBOT_SIM)
+        robot.conn = conn
+        robot.loop = loop
+        robot.connected = True
+        print("Verbonden met de simulator (sessie %s)" % ROBOT_SIM, flush=True)
+
+        if USE_CAMERA:
+            conn.start_camera(segmentation.put_frame)
+            print("Camerastream van de simulator gestart", flush=True)
+        conn.start_gps(FREEWALK_URL)
+        print("Nep-GPS van de simulator naar " + FREEWALK_URL, flush=True)
+
     async def setup():
+        if ROBOT_SIM:
+            return await setup_sim()
+
         conn = UnitreeWebRTCConnection(
             WebRTCConnectionMethod.LocalSTA,
             ip=ROBOT_IP

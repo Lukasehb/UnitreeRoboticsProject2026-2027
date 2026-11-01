@@ -57,7 +57,9 @@ TURN_CALIBRATION = 1.0        # verhoog als de robot te weinig draait, verlaag a
 
 # Camera + segmentatie
 USE_CAMERA = True             # zet op False om zonder camera/YOLO te draaien
-MODEL_PATH = "/home/jetson/jetsonOrin/signaling/models/laerbeekbos.pt"
+MODEL_PATH = os.path.join(                 # relatief aan de repo, waar die ook staat
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "signaling", "models", "laerbeekbos.pt")
 DETECTION_CONFIDENCE = 0.5    # startwaarde, op de webpagina aanpasbaar
 CONFIDENCE_CHOICES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 SCAN_HEIGHTS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]

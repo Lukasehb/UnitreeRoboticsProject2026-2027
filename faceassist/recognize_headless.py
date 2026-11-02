@@ -387,7 +387,7 @@ def main():
     # Piper TTS
     ap.add_argument("--no_tts", action="store_true")
     ap.add_argument("--piper_model", type=str,
-                    default=os.path.expanduser("~/jetsonOrin/voices/en_GB-alan-medium.onnx"))
+                    default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "voices", "en_GB-alan-medium.onnx"))
     ap.add_argument("--piper_rate", type=int, default=22050,
                     help="aplay sample rate (usually 22050 for piper voices)")
     ap.add_argument("--tts_queue_size", type=int, default=20)

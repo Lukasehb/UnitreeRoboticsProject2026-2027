@@ -38,7 +38,7 @@ FORWARD_SPEED = 0.2
 TURN_SPEED = 0.3
 COMMAND_INTERVAL_SECONDS = 0.25
 
-model = YOLO("/home/jetson/jetsonOrin/signaling/models/thuis.pt", verbose=False)
+model = YOLO(str(Path(__file__).resolve().parent.parent / "signaling" / "models" / "thuis.pt"), verbose=False)
 
 
 def print_controls():

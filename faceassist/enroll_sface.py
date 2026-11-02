@@ -171,7 +171,7 @@ def main():
     ap.add_argument("--capture_interval", type=float, default=0.5)
 
     # Piper options
-    ap.add_argument("--piper_model", type=str, default="~/jetsonOrin/voices/en_GB-alan-medium.onnx")
+    ap.add_argument("--piper_model", type=str, default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "voices", "en_GB-alan-medium.onnx"))
     ap.add_argument("--piper_rate", type=int, default=22050, help="Fallback aplay sample rate")
     ap.add_argument("--piper_rate_auto", action="store_true", help="Read sample_rate from <model>.onnx.json")
     ap.add_argument("--tts_queue_size", type=int, default=20)

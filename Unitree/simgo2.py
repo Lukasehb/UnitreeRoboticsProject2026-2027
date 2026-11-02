@@ -18,6 +18,16 @@ zichtbaar (een verborgen tab pauzeert). Start dan op de Jetson:
 
     ROBOT_SIM=CODE python3 urlcontrol.py
 
+Of zonder browser en zonder sessiecode: start de lokale simulator-API
+(server.mjs uit robotSimulatorAPI, met de API-sleutel van je account) en
+gebruik ROBOT_SIM=local. Dit script laat de tijd dan zelf in echte tijd lopen:
+
+    ROBOTSIM_KEY=rsk_... node server.mjs --show      # terminal 1, in robotSimulatorAPI
+    ROBOT_SIM=local python3 urlcontrol.py            # terminal 2
+
+Draait server.mjs op een andere computer, gebruik dan
+ROBOT_SIM=http://<ip>:8780. SIM_WORLD=park zet de robot in het park.
+
 Een testroute opnemen: rij de robot met de hand rond in de simulator en laat
 dit script om de paar meter een routepunt bewaren in stayontrails/paths/:
 
@@ -53,6 +63,12 @@ SIM_CAMERA_FPS = 10
 SIM_CAMERA_WIDTH = 640
 SIM_CAMERA_RETRY = 0.5        # s wachten na "no picture yet" (404) of een fout
 
+# Lokale simulator (server.mjs): de tijd loopt enkel als wij een step sturen
+SIM_LOCAL_URL = "http://localhost:8780"
+SIM_WORLD = os.environ.get("SIM_WORLD", "").strip()   # bv. park; leeg = het parcours
+SIM_STEP_DT = 0.05            # s per step (20 Hz), zoals de simulator standaard doet
+SIM_STEP_MAX_DT = 0.2         # trager dan echte tijd liever dan grote sprongen
+
 # Nep-GPS: de simulator geeft een pose in meter (x langs de lanes, y omhoog,
 # z opzij; yaw positief = naar links). We leggen de oorsprong van de
 # simulatorwereld op SIM_ORIGIN en rekenen x als oost en -z als noord: links
@@ -71,20 +87,90 @@ PATHS_DIR = os.path.join(os.path.dirname(HERE), "stayontrails", "paths")
 METERS_PER_DEG_LAT = 111320.0
 
 
-def load_remote_session_class():
-    """RemoteSession uit botopia.py (BOTOPIA_DIR, naast dit script, of de
-    robotSimulatorAPI-repository naast deze)."""
+def load_botopia():
+    """botopia.py uit BOTOPIA_DIR, naast dit script, of de
+    robotSimulatorAPI-repository naast deze."""
     sibling = os.path.join(os.path.dirname(os.path.dirname(HERE)), "robotSimulatorAPI", "python")
     for folder in (sibling, HERE, BOTOPIA_DIR):
         if folder and folder not in sys.path:
             sys.path.insert(0, folder)
     try:
-        from botopia import RemoteSession
+        import botopia
     except ImportError as exc:
         raise RuntimeError(
             "botopia.py niet gevonden: kopieer python/botopia.py uit robotSimulatorAPI "
             "naast simgo2.py of zet BOTOPIA_DIR") from exc
-    return RemoteSession
+    return botopia
+
+
+def is_local(code):
+    """ROBOT_SIM=local of ROBOT_SIM=http://...: de lokale simulator-API."""
+    return code.lower() == "local" or code.lower().startswith("http")
+
+
+class LocalSession:
+    """Zelfde aanroepen als RemoteSession (command, state, frame), maar op de
+    lokale simulator-API (server.mjs). Daar loopt de tijd enkel bij een step,
+    dus een thread stapt in echte tijd en stuurt de wachtende berichten mee.
+    Die thread doet alle HTTP-aanroepen: botopia's verbinding is niet
+    thread-safe."""
+
+    def __init__(self, url):
+        self.api = load_botopia().BotopiaAPI(url)
+        options = {"world": SIM_WORLD} if SIM_WORLD else {}
+        self.env_id = self.api.create("go2", options=options)["id"]
+        self._pending = []
+        self._obs = None
+        self._jpeg = None
+        self._lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def command(self, action):
+        with self._lock:
+            self._pending.append(action["webrtc"])
+        return {"queued": True}
+
+    def state(self):
+        with self._lock:
+            return {"obs": self._obs}
+
+    def frame(self, fps=10, width=640):
+        with self._lock:
+            return self._jpeg
+
+    def _run(self):
+        steps_per_frame = max(1, round(1.0 / (SIM_CAMERA_FPS * SIM_STEP_DT)))
+        image = {"view": "robot", "width": SIM_CAMERA_WIDTH}
+        last = time.monotonic()
+        count = 0
+        last_error = None
+        while True:
+            time.sleep(max(0.0, SIM_STEP_DT - (time.monotonic() - last)))
+            now = time.monotonic()
+            dt, last = min(SIM_STEP_MAX_DT, now - last), now
+            with self._lock:
+                messages, self._pending = self._pending, []
+            action = {"webrtc": messages} if messages else {}
+            try:
+                result = self.api.step(self.env_id, action, dt=dt,
+                                       image=image if count % steps_per_frame == 0 else None)
+            except Exception as exc:  # noqa: BLE001 - server.mjs even weg: blijven proberen
+                with self._lock:      # berichten niet kwijtspelen
+                    self._pending = messages + self._pending
+                if str(exc) != last_error:
+                    print("Lokale simulator: " + str(exc), flush=True)
+                    last_error = str(exc)
+                time.sleep(SIM_CAMERA_RETRY)
+                last = time.monotonic()
+                continue
+            if last_error is not None:
+                print("Lokale simulator: weer verbonden", flush=True)
+                last_error = None
+            count += 1
+            with self._lock:
+                self._obs = result.get("obs")
+                if "image" in result:
+                    self._jpeg = result["image"]
 
 
 def pose_to_latlon(pose):
@@ -137,13 +223,17 @@ class SimConnection:
     """Staat in voor UnitreeWebRTCConnection zolang er een simulator draait."""
 
     def __init__(self, code):
-        RemoteSession = load_remote_session_class()
         self.code = code
-        self.session = RemoteSession(SIM_API_URL, code)
-        # Een RemoteSession houdt één HTTP-verbinding open en is niet
-        # thread-safe: de camera krijgt er een eigen, de rest deelt er een
-        # achter een lock
-        self.camera_session = RemoteSession(SIM_API_URL, code)
+        if is_local(code):
+            url = code if code.lower().startswith("http") else SIM_LOCAL_URL
+            self.session = self.camera_session = LocalSession(url)
+        else:
+            RemoteSession = load_botopia().RemoteSession
+            self.session = RemoteSession(SIM_API_URL, code)
+            # Een RemoteSession houdt één HTTP-verbinding open en is niet
+            # thread-safe: de camera krijgt er een eigen, de rest deelt er een
+            # achter een lock
+            self.camera_session = RemoteSession(SIM_API_URL, code)
         self.datachannel = types.SimpleNamespace(pub_sub=_PubSub(self))
         self._lock = threading.Lock()
 

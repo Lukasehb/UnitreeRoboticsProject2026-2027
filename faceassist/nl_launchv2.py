@@ -801,7 +801,7 @@ def main():
     ap.add_argument(
         "--piper_model",
         type=str,
-        default="/home/jetson/jetsonOrin/voices/nl_BE-nathalie-medium.onnx",
+        default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "voices", "nl_BE-nathalie-medium.onnx"),
     )
     ap.add_argument("--piper_rate", type=int, default=22050)
     ap.add_argument("--piper_rate_auto", action="store_true")

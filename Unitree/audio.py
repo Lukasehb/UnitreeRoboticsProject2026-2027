@@ -22,7 +22,7 @@ async def main():
         await conn.connect()
 
         
-        mp3_path = "/home/jetson/jetsonOrin/Unitree/mp3/dora-doradura-mp3.mp3"
+        mp3_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mp3", "dora-doradura-mp3.mp3")
         
         logging.info(f"Playing MP3: {mp3_path}")
         player = MediaPlayer(mp3_path)  # Use MediaPlayer for MP3

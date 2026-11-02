@@ -313,7 +313,7 @@ def main():
     # Piper TTS
     ap.add_argument("--no_tts", action="store_true")
     ap.add_argument("--speak", type=str, default="True")
-    ap.add_argument("--piper_model", type=str, default="~/jetsonOrin/voices/en_GB-alan-medium.onnx")
+    ap.add_argument("--piper_model", type=str, default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "voices", "en_GB-alan-medium.onnx"))
     ap.add_argument("--piper_rate", type=int, default=22050)
     ap.add_argument("--piper_rate_auto", action="store_true")
     ap.add_argument("--piper_length_scale", type=float, default=0.6)

@@ -32,7 +32,7 @@ DETECTION_CONFIDENCE = 0.8
 SCAN_HEIGHTS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
 ALLOWED_PATH_LABELS = {"path", "path-oxod"}
 
-model = YOLO("/home/jetson/jetsonOrin/signaling/models/thuis.pt", verbose=False)
+model = YOLO(str(Path(__file__).resolve().parent.parent / "signaling" / "models" / "thuis.pt"), verbose=False)
 
 
 def get_allowed_mask_indices(result, model_names):

@@ -8,7 +8,7 @@ import argparse
 
 KNOWN_DIR = "known"
 OUTPUT_DIR = "speech_mp3"
-PIPER_MODEL = "/home/jetson/jetsonOrin/voices/nl_BE-nathalie-medium.onnx"
+PIPER_MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "voices", "nl_BE-nathalie-medium.onnx")
 
 
 def load_names(known_dir):

@@ -42,6 +42,8 @@ ROBOT_IP = os.environ.get("ROBOT_IP", "10.2.172.215")   # of: ROBOT_IP=x.x.x.x p
 ROBOT_SIM = os.environ.get("ROBOT_SIM", "").strip()     # ROBOT_SIM=729AM9 python3 urlcontrol.py
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8080
+# followpathCombined.php (Edge-modus) vraagt /guidance op vanaf deze site
+GUIDANCE_ORIGIN = os.environ.get("GUIDANCE_ORIGIN", "https://stayontrails.ehb.be")
 
 MOVE_SPEED = 0.5
 TURN_SPEED = 1
@@ -3168,6 +3170,26 @@ def status():
         "follow_changes": path_follower.changes,
         "route": route_follower.snapshot(),
     })
+
+
+@app.route("/guidance")
+def guidance():
+    """De richting voor followpathCombined.php (Edge-modus), zoals de
+    cloudserver: 90 = rechtdoor, en ook 90 als er geen pad in beeld is."""
+    heading = segmentation.current_heading()
+    return jsonify({"heading": round(heading, 1) if heading is not None else 90.0})
+
+
+@app.after_request
+def add_guidance_cors(response):
+    # De pagina komt van https://stayontrails.ehb.be en spreekt via adb reverse
+    # http://localhost:8080 aan: die site moet /guidance mogen lezen
+    if request.path.startswith("/guidance"):
+        response.headers["Access-Control-Allow-Origin"] = GUIDANCE_ORIGIN
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+        response.headers["Vary"] = "Origin"
+    return response
 
 
 @app.route("/route/paths")

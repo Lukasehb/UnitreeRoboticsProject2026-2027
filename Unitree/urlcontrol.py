@@ -154,8 +154,11 @@ ROUTE_CORRECTION_COOLDOWN = 10.0  # s tussen twee correcties
 FOLLOW_DEADBAND = 3.0         # graden verschil waarbinnen we niet bijsturen
 FOLLOW_FULL_TURN = 90.0       # graden verschil waarbij we op volle bijstuursnelheid zitten
 FOLLOW_TURN_SPEED = 0.6       # rad/s bij die afwijking; los van de draaiknoppen
+FOLLOW_CURVE_SPEED = 0.3      # deel van MOVE_SPEED bij die afwijking: trager in de bocht
 FOLLOW_INTERVAL = 0.15        # s tussen twee move-commando's tijdens het volgen
-FOLLOW_NO_PATH_FRAMES = 5     # zoveel beelden na elkaar zonder pad voor we stoppen (~1 s)
+FOLLOW_NO_PATH_FRAMES = 5     # zoveel beelden na elkaar zonder pad voor we gaan zoeken (~1 s)
+FOLLOW_SEARCH_SECONDS = 6.0   # zo lang ter plaatse draaien naar het pad voor we stoppen
+FOLLOW_SEARCH_TURN_SPEED = 0.5  # rad/s tijdens dat zoeken (6 s is zo'n 170 graden)
 MARKER_MAX_AGE = 0.6          # s waarna we een geziene marker als verdwenen beschouwen
 DISCO_COLOURS = [VUI_COLOR.RED, VUI_COLOR.YELLOW, VUI_COLOR.GREEN,
                  VUI_COLOR.CYAN, VUI_COLOR.BLUE, VUI_COLOR.PURPLE]
@@ -264,15 +267,21 @@ class RobotController:
 
         We rekenen met FOLLOW_TURN_SPEED en niet met TURN_SPEED: dat laatste
         is de draaisnelheid van de knoppen links en rechts, een bewuste snelle
-        draai. Voor bijsturen is dat veel te hard."""
+        draai. Voor bijsturen is dat veel te hard.
+
+        In een bocht stappen we ook trager vooruit, tot FOLLOW_CURVE_SPEED
+        van MOVE_SPEED: anders wordt de bocht te ruim en loopt de robot ze
+        voorbij."""
         error = heading - HEADING_FORWARD
+        share = clamp(error / FOLLOW_FULL_TURN, -1.0, 1.0)
         if abs(error) < FOLLOW_DEADBAND:
             z = 0.0
         else:
             # Evenredig met de afwijking; positieve z is links
-            z = -clamp(error / FOLLOW_FULL_TURN, -1.0, 1.0) * FOLLOW_TURN_SPEED
+            z = -share * FOLLOW_TURN_SPEED
 
-        return self.move(x=MOVE_SPEED, z=z)
+        x = MOVE_SPEED * (1.0 - (1.0 - FOLLOW_CURVE_SPEED) * abs(share))
+        return self.move(x=x, z=z)
 
     def follow_path(self):
         """Het pad volgen zoals de camera het ziet.
@@ -1616,6 +1625,8 @@ class PathFollower:
         self._last_frame_at = 0.0 # updated_at van het beeld dat we al beoordeeld hebben
         self._aim_id = None       # de richtingsmarker waarop we nu uitlijnen
         self._arrived_count = 0   # beelden na elkaar op de ingestelde afstand
+        self._search_side = None  # +1 links, -1 rechts: waar het pad het laatst lag
+        self._searching_since = None  # sinds wanneer we ter plaatse naar het pad zoeken
 
     def toggle(self):
         """Aan- of uitzetten, wat de knop 'volg pad' doet."""
@@ -1637,6 +1648,8 @@ class PathFollower:
         self._last_frame_at = 0.0
         self._aim_id = None
         self._arrived_count = 0
+        self._search_side = None
+        self._searching_since = None
 
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -1773,6 +1786,11 @@ class PathFollower:
                         break
                     robot.note_command("naar aruco %d" % aim["id"])
                     robot.steer_to(aim["heading"])
+                elif self._searching_since is not None:
+                    # Pad kwijt in een bocht: niet blind rechtdoor, maar ter
+                    # plaatse draaien naar de kant waar het het laatst lag
+                    robot.note_command("zoek pad")
+                    robot.move(x=0, z=self._search_side * FOLLOW_SEARCH_TURN_SPEED)
                 else:
                     robot.note_command("volg pad")
                     robot.follow_path()
@@ -1829,13 +1847,35 @@ class PathFollower:
         # Enkel een beeld dat we nog niet bekeken hebben telt mee
         if updated_at != self._last_frame_at:
             self._last_frame_at = updated_at
-            if segmentation.current_heading() is None:
+            heading = segmentation.current_heading()
+            if heading is None:
                 self._no_path_count += 1
             else:
                 self._no_path_count = 0
+                if self._searching_since is not None:
+                    print("Pad teruggevonden", flush=True)
+                    self._searching_since = None
+                # Onthoud aan welke kant het pad lag; lag het recht vooruit,
+                # dan is er niets om naar te zoeken
+                error = heading - HEADING_FORWARD
+                if abs(error) < FOLLOW_DEADBAND:
+                    self._search_side = None
+                else:
+                    self._search_side = 1 if error < 0 else -1
 
-        if self._no_path_count >= FOLLOW_NO_PATH_FRAMES:
+        if self._no_path_count < FOLLOW_NO_PATH_FRAMES:
+            return None
+
+        # Verdwijnt het pad recht vooruit, dan is het gedaan: stoppen. Lag het
+        # opzij, dan zijn we wellicht een bocht voorbijgelopen: eerst zoeken
+        if self._search_side is None:
             return "geen pad op %d beelden" % self._no_path_count
+        if self._searching_since is None:
+            self._searching_since = time.monotonic()
+            print("Pad kwijt, zoeken naar %s" %
+                  ("links" if self._search_side > 0 else "rechts"), flush=True)
+        elif time.monotonic() - self._searching_since > FOLLOW_SEARCH_SECONDS:
+            return "pad niet teruggevonden na %d s zoeken" % FOLLOW_SEARCH_SECONDS
         return None
 
 
@@ -3172,21 +3212,94 @@ def status():
     })
 
 
+def page_heading(heading):
+    """Een heading van deze pagina in de conventie van de cloudserver en
+    followpathCombined.php: 90 = rechtdoor, en ook 90 als er geen pad is.
+
+    Let op: de cloudserver en de pagina rekenen meer dan 90 als links, deze
+    pagina (compute_heading_to_point) als rechts. We spiegelen dus terug."""
+    if heading is None:
+        return 90.0
+    return round(2 * HEADING_FORWARD - heading, 1)
+
+
 @app.route("/guidance")
 def guidance():
-    """De richting voor followpathCombined.php (Edge-modus), zoals de
-    cloudserver: 90 = rechtdoor, en ook 90 als er geen pad in beeld is."""
-    heading = segmentation.current_heading()
-    return jsonify({"heading": round(heading, 1) if heading is not None else 90.0})
+    """De richting voor followpathCombined.php (Edge-modus), uit de camera
+    van de robot."""
+    return jsonify({"heading": page_heading(segmentation.current_heading())})
+
+
+class PhoneSegmentation:
+    """Het pad zoeken in beelden van de gsm-camera (POST /segment).
+
+    De gsm hangt met USB aan de Jetson en stuurt zijn camerabeelden naar
+    localhost:8080, in plaats van naar de cloud. Dit model staat los van dat
+    van de robotcamera: die thread draait gewoon door, en zo zitten de twee
+    elkaar niet in de weg. We volgen wel hetzelfde model en dezelfde
+    confidence als op de webpagina gekozen. Eén beeld tegelijk."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._model = None
+        self._model_name = None
+
+    def segment(self, image):
+        """Heading (conventie van deze pagina, of None) en de rekentijd in ms."""
+        with self._lock:
+            wanted = segmentation.model_name
+            if self._model is None or self._model_name != wanted:
+                from ultralytics import YOLO
+                self._model = YOLO(os.path.join(MODEL_DIR, wanted), verbose=False)
+                self._model_name = wanted
+                print("Model voor de gsm-camera geladen: " + wanted, flush=True)
+
+            started = time.monotonic()
+            heading, _overlay = segment_frame(image, self._model, segmentation.confidence)
+            return heading, (time.monotonic() - started) * 1000.0
+
+
+phone_segmentation = PhoneSegmentation()
+
+
+@app.route("/segment", methods=["POST"])
+def segment():
+    """Een beeld van de gsm-camera: het pad zoeken en de richting teruggeven.
+
+    De body is het JPEG-beeld zelf (Content-Type: image/jpeg), zoals de
+    pagina het uit haar canvas haalt. ?frame_id= komt ongewijzigd terug, zo
+    kan de pagina de vertraging meten. Het antwoord volgt de cloudserver:
+    {"heading": 92.5, "frame_id": "12", "path": true, "ms": 85.3}."""
+    if cv2 is None or np is None:
+        return jsonify({"ok": False, "error": "opencv of numpy ontbreekt"}), 503
+
+    image = cv2.imdecode(np.frombuffer(request.get_data(), np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        return jsonify({"ok": False, "error": "geen geldig JPEG-beeld"}), 400
+
+    try:
+        heading, ms = phone_segmentation.segment(image)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    return jsonify({
+        "heading": page_heading(heading),
+        "frame_id": request.args.get("frame_id"),
+        "path": heading is not None,
+        "ms": round(ms, 1),
+    })
 
 
 @app.after_request
 def add_guidance_cors(response):
     # De pagina komt van https://stayontrails.ehb.be en spreekt via adb reverse
-    # http://localhost:8080 aan: die site moet /guidance mogen lezen
-    if request.path.startswith("/guidance"):
+    # http://localhost:8080 aan: die site moet /guidance lezen en beelden
+    # naar /segment sturen. Een JPEG-body vraagt een preflight, vandaar
+    # Allow-Headers.
+    if request.path.startswith(("/guidance", "/segment")):
         response.headers["Access-Control-Allow-Origin"] = GUIDANCE_ORIGIN
-        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
         response.headers["Access-Control-Allow-Private-Network"] = "true"
         response.headers["Vary"] = "Origin"
     return response

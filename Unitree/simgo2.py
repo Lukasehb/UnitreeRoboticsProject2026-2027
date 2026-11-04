@@ -26,7 +26,10 @@ gebruik ROBOT_SIM=local. Dit script laat de tijd dan zelf in echte tijd lopen:
     ROBOT_SIM=local python3 urlcontrol.py            # terminal 2
 
 Draait server.mjs op een andere computer, gebruik dan
-ROBOT_SIM=http://<ip>:8780. SIM_WORLD=park zet de robot in het park.
+ROBOT_SIM=http://<ip>:8780. SIM_WORLD=park zet de robot in het park; hij
+start op het pad (SIM_LANE=track). Het YOLO-model voor dat pad is
+python/models/track_yolo.pt uit robotSimulatorAPI: kopieer het naar
+signaling/models/ en kies het met /model/?name=track_yolo.pt.
 
 Een testroute opnemen: rij de robot met de hand rond in de simulator en laat
 dit script om de paar meter een routepunt bewaren in stayontrails/paths/:
@@ -66,6 +69,8 @@ SIM_CAMERA_RETRY = 0.5        # s wachten na "no picture yet" (404) of een fout
 # Lokale simulator (server.mjs): de tijd loopt enkel als wij een step sturen
 SIM_LOCAL_URL = "http://localhost:8780"
 SIM_WORLD = os.environ.get("SIM_WORLD", "").strip()   # bv. park; leeg = het parcours
+# track = de robot start op het geschilderde pad (de ε-lus); free = het startvak
+SIM_LANE = os.environ.get("SIM_LANE", "track").strip() or "track"
 SIM_STEP_DT = 0.05            # s per step (20 Hz), zoals de simulator standaard doet
 SIM_STEP_MAX_DT = 0.2         # trager dan echte tijd liever dan grote sprongen
 
@@ -118,7 +123,7 @@ class LocalSession:
     def __init__(self, url):
         self.api = load_botopia().BotopiaAPI(url)
         options = {"world": SIM_WORLD} if SIM_WORLD else {}
-        self.env_id = self.api.create("go2", options=options)["id"]
+        self.env_id = self.api.create("go2", lane=SIM_LANE, options=options)["id"]
         self._pending = []
         self._obs = None
         self._jpeg = None

@@ -926,7 +926,22 @@ def segment_frame(frame, model, confidence):
 
     overlay = frame.copy()
     draw_path_overlay(overlay, result, mask_index, midpoints, heading)
-    return heading, overlay
+    return heading, overlay, path_outline(result, mask_index)
+
+
+def path_outline(result, mask_index, tolerance=2.0):
+    """De omtrek van het gevonden pad als [[x, y], ...] in beeldpunten, of [].
+
+    Vereenvoudigd tot een handvol hoekpunten: genoeg om op de webpagina over
+    het camerabeeld te tekenen, zonder honderden punten mee te sturen."""
+    masks_xy = getattr(result.masks, "xy", None) if result.masks is not None else None
+    if masks_xy is None or mask_index is None or mask_index >= len(masks_xy):
+        return []
+    polygon = np.asarray(masks_xy[mask_index], dtype=np.float32)
+    if len(polygon) < 3:
+        return []
+    simple = cv2.approxPolyDP(polygon.reshape((-1, 1, 2)), tolerance, True)
+    return [[int(round(x)), int(round(y))] for x, y in simple.reshape((-1, 2))]
 
 
 def fit_to_stream_size(image):
@@ -1394,7 +1409,7 @@ class Segmentation:
                 continue
 
             try:
-                heading, overlay = segment_frame(image, model, self.confidence)
+                heading, overlay, _outline = segment_frame(image, model, self.confidence)
 
                 # De grootste ArUco-marker krijgt een kader op hetzelfde beeld,
                 # behalve als de noodstopmarker in beeld ligt: die gaat voor,
@@ -3245,7 +3260,8 @@ class PhoneSegmentation:
         self._model_name = None
 
     def segment(self, image):
-        """Heading (conventie van deze pagina, of None) en de rekentijd in ms."""
+        """Heading (conventie van deze pagina, of None), de omtrek van het pad
+        en de rekentijd in ms."""
         with self._lock:
             wanted = segmentation.model_name
             if self._model is None or self._model_name != wanted:
@@ -3255,8 +3271,8 @@ class PhoneSegmentation:
                 print("Model voor de gsm-camera geladen: " + wanted, flush=True)
 
             started = time.monotonic()
-            heading, _overlay = segment_frame(image, self._model, segmentation.confidence)
-            return heading, (time.monotonic() - started) * 1000.0
+            heading, _overlay, outline = segment_frame(image, self._model, segmentation.confidence)
+            return heading, outline, (time.monotonic() - started) * 1000.0
 
 
 phone_segmentation = PhoneSegmentation()
@@ -3269,7 +3285,9 @@ def segment():
     De body is het JPEG-beeld zelf (Content-Type: image/jpeg), zoals de
     pagina het uit haar canvas haalt. ?frame_id= komt ongewijzigd terug, zo
     kan de pagina de vertraging meten. Het antwoord volgt de cloudserver:
-    {"heading": 92.5, "frame_id": "12", "path": true, "ms": 85.3}."""
+    {"heading": 92.5, "frame_id": "12", "path": true, "ms": 85.3,
+     "masks": [[[x, y], ...]]}. masks is de omtrek van het pad in de
+    beeldpunten van het opgestuurde beeld, om op de pagina te tekenen."""
     if cv2 is None or np is None:
         return jsonify({"ok": False, "error": "opencv of numpy ontbreekt"}), 503
 
@@ -3278,7 +3296,7 @@ def segment():
         return jsonify({"ok": False, "error": "geen geldig JPEG-beeld"}), 400
 
     try:
-        heading, ms = phone_segmentation.segment(image)
+        heading, outline, ms = phone_segmentation.segment(image)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -3287,6 +3305,7 @@ def segment():
         "frame_id": request.args.get("frame_id"),
         "path": heading is not None,
         "ms": round(ms, 1),
+        "masks": [outline] if outline else [],
     })
 
 

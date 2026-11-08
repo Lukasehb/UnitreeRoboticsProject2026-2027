@@ -889,7 +889,7 @@ def draw_path_overlay(frame, result, mask_index, midpoints, heading):
                 HEADING_COLOR, 2, cv2.LINE_AA)
 
 
-def segment_frame(frame, model, confidence):
+def segment_frame(frame, model, confidence, draw=True):
     """Zoek het pad in het beeld en geef de heading ernaartoe, samen met een
     kopie van het beeld waarop het masker getekend staat (voor de live stream).
 
@@ -924,8 +924,12 @@ def segment_frame(frame, model, confidence):
         # stoppen, in plaats van blind op 90 graden rechtdoor te lopen.
         heading = None
 
-    overlay = frame.copy()
-    draw_path_overlay(overlay, result, mask_index, midpoints, heading)
+    # Het overlaybeeld is enkel voor de live stream; wie het niet nodig heeft
+    # (POST /segment) spaart het kopiëren en tekenen uit
+    overlay = None
+    if draw:
+        overlay = frame.copy()
+        draw_path_overlay(overlay, result, mask_index, midpoints, heading)
     return heading, overlay, path_outline(result, mask_index)
 
 
@@ -3258,6 +3262,7 @@ class PhoneSegmentation:
         self._lock = threading.Lock()
         self._model = None
         self._model_name = None
+        self.gpu = None           # rekent het model op de GPU (CUDA)? Bekend na het laden
 
     def segment(self, image):
         """Heading (conventie van deze pagina, of None), de omtrek van het pad
@@ -3266,12 +3271,18 @@ class PhoneSegmentation:
             wanted = segmentation.model_name
             if self._model is None or self._model_name != wanted:
                 from ultralytics import YOLO
+                import torch
                 self._model = YOLO(os.path.join(MODEL_DIR, wanted), verbose=False)
                 self._model_name = wanted
-                print("Model voor de gsm-camera geladen: " + wanted, flush=True)
+                # Zonder CUDA (bv. de gewone pip-torch op ARM) rekent het model
+                # op de CPU, en dat is op de Jetson vele keren trager
+                self.gpu = torch.cuda.is_available()
+                print("Model voor de gsm-camera geladen: %s (%s)"
+                      % (wanted, "GPU" if self.gpu else "CPU"), flush=True)
 
             started = time.monotonic()
-            heading, _overlay, outline = segment_frame(image, self._model, segmentation.confidence)
+            heading, _overlay, outline = segment_frame(
+                image, self._model, segmentation.confidence, draw=False)
             return heading, outline, (time.monotonic() - started) * 1000.0
 
 
@@ -3305,6 +3316,7 @@ def segment():
         "frame_id": request.args.get("frame_id"),
         "path": heading is not None,
         "ms": round(ms, 1),
+        "gpu": phone_segmentation.gpu,
         "masks": [outline] if outline else [],
     })
 
@@ -3320,6 +3332,9 @@ def add_guidance_cors(response):
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
         response.headers["Access-Control-Allow-Private-Network"] = "true"
+        # Zonder dit vraagt Chrome om de 5 s opnieuw een preflight: een extra
+        # heen-en-weer over de USB-kabel voor elk beeld dat dan vertrekt
+        response.headers["Access-Control-Max-Age"] = "7200"
         response.headers["Vary"] = "Origin"
     return response
 

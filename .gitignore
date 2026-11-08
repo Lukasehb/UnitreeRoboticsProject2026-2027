@@ -20,3 +20,8 @@ authtokens.csv
 
 # Foto's die urlcontrol.py van het camerabeeld bewaart
 /Unitree/fotos
+
+# TensorRT- en ONNX-exports van de modellen: groot en enkel bruikbaar op de
+# Jetson waar ze gemaakt zijn (yolo export ... format=engine)
+/signaling/models/*.engine
+/signaling/models/*.onnx

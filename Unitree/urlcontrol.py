@@ -21,6 +21,7 @@ import urllib.parse
 import urllib.request
 
 from flask import Flask, Response, jsonify, render_template_string, request
+from werkzeug.serving import WSGIRequestHandler
 
 try:
     import cv2
@@ -58,19 +59,32 @@ TURN_INTERVAL = 0.1           # s tussen twee move-commando's tijdens het draaie
 TURN_CALIBRATION = 1.0        # verhoog als de robot te weinig draait, verlaag als te veel
 
 # Camera + segmentatie
-USE_CAMERA = True             # zet op False om zonder camera/YOLO te draaien
+# Zet op False (of start met USE_CAMERA=0) om zonder robotcamera/YOLO te draaien
+USE_CAMERA = os.environ.get("USE_CAMERA", "1") != "0"
 MODEL_PATH = os.path.join(                 # relatief aan de repo, waar die ook staat
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "signaling", "models", "laerbeekbos.pt")
 DETECTION_CONFIDENCE = 0.5    # startwaarde, op de webpagina aanpasbaar
 CONFIDENCE_CHOICES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 SCAN_HEIGHTS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
-MODEL_DIR = os.path.dirname(MODEL_PATH)   # hier zoeken we de andere .pt-bestanden
+MODEL_DIR = os.path.dirname(MODEL_PATH)   # hier zoeken we de andere modellen
+# Staat er een TensorRT-versie naast (laerbeekbos.engine, gemaakt met
+# yolo export model=laerbeekbos.pt format=engine half=True), dan nemen we die:
+# die rekent op de Jetson veel sneller dan het .pt-bestand.
+if os.path.isfile(os.path.splitext(MODEL_PATH)[0] + ".engine"):
+    MODEL_PATH = os.path.splitext(MODEL_PATH)[0] + ".engine"
+MODEL_EXTENSIONS = (".pt", ".engine")
 ALLOWED_PATH_LABELS = {"path", "path-oxod"}
 FRAME_INTERVAL = 0.2          # s tussen twee frames die we bijhouden (5 fps volstaat)
 SEGMENTATION_INTERVAL = 0.2   # s wachten na een fout voor we opnieuw proberen
 FRAME_WAIT_TIMEOUT = 0.5      # s wachten op een beeld voor de lus toch rondgaat
 MARKER_CACHE_FRAMES = 16      # zoveel markerresultaten houden we bij voor de segmentatie
+# Stuurt de gsm beelden naar /segment, dan zet de robotcamera haar eigen
+# YOLO-model even stil, zodat het gsm-model de GPU voor zich heeft. De
+# ArUco-markers (en dus de noodstop) worden op het robotbeeld wel nog gezocht.
+# Volgt de robot zelf het pad (path_follower), dan pauzeren we nooit.
+PAUSE_ROBOT_YOLO_FOR_PHONE = os.environ.get("PAUSE_ROBOT_YOLO_FOR_PHONE", "1") != "0"
+PHONE_ACTIVE_WINDOW = 2.0     # s na het laatste gsm-beeld dat de pauze duurt
 HEADING_MAX_AGE = 3.0         # s waarna we een heading als verouderd beschouwen
 
 # Foto's van het ruwe camerabeeld: op vraag of om de zoveel tijd
@@ -792,10 +806,10 @@ def draw_marker(frame, marker):
 
 
 def available_models():
-    """De .pt-bestanden die naast het ingestelde model staan."""
+    """De modellen (.pt en TensorRT .engine) die naast het ingestelde model staan."""
     try:
         names = [name for name in os.listdir(MODEL_DIR or ".")
-                 if name.lower().endswith(".pt")]
+                 if name.lower().endswith(MODEL_EXTENSIONS)]
     except OSError:
         names = []
     return sorted(names)
@@ -823,21 +837,26 @@ def largest_allowed_mask(result, model_names, shape):
 
     Geeft de index en het masker op beeldformaat terug, of (None, None)."""
     h, w = shape
-    best_index, best_mask, best_area = None, None, 0
+    best_index, best_area = None, 0
 
+    # De oppervlakte tellen we op het masker zoals het uit het model komt,
+    # nog op de GPU. Pas het grootste gaat naar de CPU en wordt vergroot tot
+    # beeldformaat: dat kopiëren en schalen kost anders per masker tijd.
     for index in get_allowed_mask_indices(result, model_names):
         if index >= len(result.masks.data):
             continue
 
-        mask = result.masks.data[index].cpu().numpy()
-        mask = (mask * 255).astype(np.uint8)
-        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-
-        area = int(np.count_nonzero(mask))
+        area = float((result.masks.data[index] > 0.5).sum())
         if area > best_area:
-            best_index, best_mask, best_area = index, mask, area
+            best_index, best_area = index, area
 
-    return best_index, best_mask
+    if best_index is None:
+        return None, None
+
+    mask = result.masks.data[best_index].cpu().numpy()
+    mask = (mask * 255).astype(np.uint8)
+    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    return best_index, mask
 
 
 def compute_heading_to_point(frame, target_x, target_y):
@@ -889,16 +908,49 @@ def draw_path_overlay(frame, result, mask_index, midpoints, heading):
                 HEADING_COLOR, 2, cv2.LINE_AA)
 
 
-def segment_frame(frame, model, confidence, draw=True):
+_INFERENCE_DEVICE = None
+
+
+def inference_device():
+    """0 (de GPU) als PyTorch CUDA vindt, anders "cpu". We geven dit expliciet
+    mee aan YOLO en zetten het bij het opstarten in de log, zodat meteen
+    zichtbaar is of de Jetson op de GPU rekent."""
+    global _INFERENCE_DEVICE
+    if _INFERENCE_DEVICE is None:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                _INFERENCE_DEVICE = 0
+                print("YOLO rekent op de GPU: " + torch.cuda.get_device_name(0), flush=True)
+            else:
+                _INFERENCE_DEVICE = "cpu"
+                print("YOLO rekent op de CPU: PyTorch vindt geen CUDA", flush=True)
+        except Exception as exc:
+            _INFERENCE_DEVICE = "cpu"
+            print("YOLO rekent op de CPU: " + str(exc), flush=True)
+    return _INFERENCE_DEVICE
+
+
+def segment_frame(frame, model, confidence, draw=True, timings=None):
     """Zoek het pad in het beeld en geef de heading ernaartoe, samen met een
     kopie van het beeld waarop het masker getekend staat (voor de live stream).
 
     We houden enkel het grootste pad over.  Daarvan kijken we op een aantal
     hoogtes waar het zit, en we mikken op het gemiddelde van die punten. Wordt
     er niets gevonden, dan geven we recht vooruit terug.  Hoe lager de
-    confidence, hoe sneller het model iets een pad noemt."""
+    confidence, hoe sneller het model iets een pad noemt.
+
+    Met draw=False tekenen we geen overlay (de gsm heeft die niet nodig) en is
+    het tweede resultaat None. Een dict in timings krijgt de tijden van YOLO
+    (preprocess, inference, postprocess) en van onze eigen nabewerking, in ms."""
     h, w = frame.shape[:2]
-    result = model(frame, conf=confidence, verbose=False)[0]
+    frame_started = time.monotonic()
+    device = inference_device()
+    # Op de GPU rekenen we in FP16: op een Jetson Orin scheelt dat veel tijd
+    # (een .engine heeft zijn precisie al vast bij het exporteren)
+    result = model(frame, conf=confidence, verbose=False,
+                   device=device, half=device != "cpu")[0]
+    post_started = time.monotonic()
     model_names = getattr(model, "names", {})
     midpoints = []
     mask_index, mask = None, None
@@ -924,13 +976,102 @@ def segment_frame(frame, model, confidence, draw=True):
         # stoppen, in plaats van blind op 90 graden rechtdoor te lopen.
         heading = None
 
-    # Het overlaybeeld is enkel voor de live stream; wie het niet nodig heeft
-    # (POST /segment) spaart het kopiëren en tekenen uit
     overlay = None
     if draw:
         overlay = frame.copy()
         draw_path_overlay(overlay, result, mask_index, midpoints, heading)
-    return heading, overlay, path_outline(result, mask_index)
+    outline = path_outline(result, mask_index)
+
+    if timings is not None:
+        # Wat het model zag (klasse en zekerheid), om te zien waarom er geen
+        # pad gevonden wordt: geen detecties, of wel maar met een andere naam
+        detections = []
+        if result.boxes is not None and result.boxes.cls is not None:
+            for class_id, conf in zip(result.boxes.cls.cpu().tolist(),
+                                      result.boxes.conf.cpu().tolist()):
+                detections.append([str(model_names.get(int(class_id), int(class_id))),
+                                   round(float(conf), 2)])
+        timings["detecties"] = detections
+        for key, value in (getattr(result, "speed", None) or {}).items():
+            timings[key] = round(float(value), 1)
+        now = time.monotonic()
+        timings["eigen"] = round((now - post_started) * 1000.0, 1)
+        timings["totaal"] = round((now - frame_started) * 1000.0, 1)
+    return heading, overlay, outline
+
+
+TIMING_LOG_INTERVAL = 5.0     # s tussen twee samenvattingen van de rekentijd
+
+
+class InferenceStats:
+    """Houdt de rekentijden van YOLO bij en zet om de TIMING_LOG_INTERVAL s
+    een samenvatting in de terminal, bv.
+
+    [gsm] 24 beelden 640x480 | inference gem 24.3 ms (min 21.0, max 31.2) | pre 2.1 | post 6.5 | eigen 3.0 | totaal 36.4 ms
+
+    "inference" is het model zelf op de GPU (Ultralytics wacht daarbij op de
+    GPU, dus het is de echte rekentijd). "pre" is het beeld klaarzetten,
+    "post" het omzetten van de maskers, "eigen" onze nabewerking en "totaal"
+    alles samen in segment_frame. Ook op te vragen via GET /timings."""
+
+    KEYS = ("preprocess", "inference", "postprocess", "eigen", "totaal")
+
+    def __init__(self, name):
+        self.name = name
+        self._lock = threading.Lock()
+        self._samples = []
+        self._started = time.monotonic()
+        self.size = None
+        self.last = {}         # de vorige samenvatting, voor /timings
+
+    def should_log_detections(self):
+        """Om de TIMING_LOG_INTERVAL s één keer True: dan zetten we ook wat
+        het model zag in de terminal, zonder die vol te schrijven."""
+        now = time.monotonic()
+        if now - getattr(self, "_last_detection_log", 0.0) >= TIMING_LOG_INTERVAL:
+            self._last_detection_log = now
+            return True
+        return False
+
+    def add(self, timings, size=None):
+        timings = {k: v for k, v in timings.items() if k != "detecties"}
+        with self._lock:
+            self._samples.append(dict(timings))
+            if size:
+                self.size = size
+            if time.monotonic() - self._started >= TIMING_LOG_INTERVAL:
+                self._flush()
+
+    def _flush(self):
+        samples, self._samples = self._samples, []
+        self._started = time.monotonic()
+        if not samples:
+            return
+        summary = {"beelden": len(samples), "grootte": self.size}
+        for key in self.KEYS:
+            values = [float(item[key]) for item in samples if key in item]
+            if values:
+                summary[key] = {
+                    "gem": round(sum(values) / len(values), 1),
+                    "min": round(min(values), 1),
+                    "max": round(max(values), 1),
+                }
+        self.last = summary
+
+        def avg(key):
+            return summary[key]["gem"] if key in summary else float("nan")
+
+        inference = summary.get("inference", {"gem": float("nan"), "min": float("nan"), "max": float("nan")})
+        size = "%dx%d" % self.size if self.size else "?"
+        print("[%s] %d beelden %s | inference gem %.1f ms (min %.1f, max %.1f) | "
+              "pre %.1f | post %.1f | eigen %.1f | totaal %.1f ms"
+              % (self.name, len(samples), size, inference["gem"], inference["min"],
+                 inference["max"], avg("preprocess"), avg("postprocess"),
+                 avg("eigen"), avg("totaal")), flush=True)
+
+
+phone_stats = InferenceStats("gsm")
+robot_stats = InferenceStats("robot")
 
 
 def path_outline(result, mask_index, tolerance=2.0):
@@ -1393,7 +1534,7 @@ class Segmentation:
                 self.status = "model laden"
                 loaded_name = wanted
                 try:
-                    model = YOLO(os.path.join(MODEL_DIR, wanted), verbose=False)
+                    model = YOLO(os.path.join(MODEL_DIR, wanted), task="segment", verbose=False)
                     self.status = "wachten op beeld"
                     self.error = None
                     print("Model geladen: " + wanted, flush=True)
@@ -1413,7 +1554,14 @@ class Segmentation:
                 continue
 
             try:
-                heading, overlay, _outline = segment_frame(image, model, self.confidence)
+                paused = robot_yolo_paused()
+                if paused:
+                    heading, overlay = None, image.copy()
+                else:
+                    timings = {}
+                    heading, overlay, _outline = segment_frame(
+                        image, model, self.confidence, timings=timings)
+                    robot_stats.add(timings, (image.shape[1], image.shape[0]))
 
                 # De grootste ArUco-marker krijgt een kader op hetzelfde beeld,
                 # behalve als de noodstopmarker in beeld ligt: die gaat voor,
@@ -1453,6 +1601,11 @@ class Segmentation:
                 continue
 
             self._publish_stream(overlay, annotated=True)
+            if paused:
+                # Geen nieuwe heading: de oude veroudert vanzelf (HEADING_MAX_AGE)
+                self.status = "gepauzeerd: gsm-camera actief"
+                self.error = None
+                continue
             self.heading = None if heading is None else clamp(float(heading), 0.0, 180.0)
             self.updated_at = time.monotonic()
             self.status = "actief"
@@ -3242,6 +3395,18 @@ def page_heading(heading):
     return round(2 * HEADING_FORWARD - heading, 1)
 
 
+@app.route("/timings")
+def timings_route():
+    """De laatste samenvatting van de rekentijden (zie InferenceStats)."""
+    device = _INFERENCE_DEVICE
+    return jsonify({
+        "device": "gpu" if device == 0 else device,
+        "interval_s": TIMING_LOG_INTERVAL,
+        "gsm": phone_stats.last,
+        "robot": robot_stats.last,
+    })
+
+
 @app.route("/guidance")
 def guidance():
     """De richting voor followpathCombined.php (Edge-modus), uit de camera
@@ -3262,31 +3427,45 @@ class PhoneSegmentation:
         self._lock = threading.Lock()
         self._model = None
         self._model_name = None
-        self.gpu = None           # rekent het model op de GPU (CUDA)? Bekend na het laden
+        self.model_name = None    # voor het antwoord van /segment
+        self.last_at = 0.0        # time.monotonic() van het laatste gsm-beeld
 
     def segment(self, image):
-        """Heading (conventie van deze pagina, of None), de omtrek van het pad
-        en de rekentijd in ms."""
+        """Heading (conventie van deze pagina, of None), de omtrek van het pad,
+        de rekentijd in ms en de tijden per stap (zie segment_frame)."""
+        self.last_at = time.monotonic()
         with self._lock:
             wanted = segmentation.model_name
             if self._model is None or self._model_name != wanted:
                 from ultralytics import YOLO
-                import torch
-                self._model = YOLO(os.path.join(MODEL_DIR, wanted), verbose=False)
+                self._model = YOLO(os.path.join(MODEL_DIR, wanted), task="segment", verbose=False)
                 self._model_name = wanted
-                # Zonder CUDA (bv. de gewone pip-torch op ARM) rekent het model
-                # op de CPU, en dat is op de Jetson vele keren trager
-                self.gpu = torch.cuda.is_available()
-                print("Model voor de gsm-camera geladen: %s (%s)"
-                      % (wanted, "GPU" if self.gpu else "CPU"), flush=True)
+                self.model_name = wanted
+                print("Model voor de gsm-camera geladen: " + wanted, flush=True)
 
             started = time.monotonic()
+            timings = {}
             heading, _overlay, outline = segment_frame(
-                image, self._model, segmentation.confidence, draw=False)
-            return heading, outline, (time.monotonic() - started) * 1000.0
+                image, self._model, segmentation.confidence, draw=False, timings=timings)
+            phone_stats.add(timings, (image.shape[1], image.shape[0]))
+            if phone_stats.should_log_detections():
+                print("[gsm] model %s, conf %.2f, detecties: %s"
+                      % (self._model_name, segmentation.confidence,
+                         timings.get("detecties") or "geen"), flush=True)
+            return heading, outline, (time.monotonic() - started) * 1000.0, timings
 
 
 phone_segmentation = PhoneSegmentation()
+
+
+def robot_yolo_paused():
+    """Moet de robotcamera haar YOLO-model nu overslaan? Enkel als de gsm de
+    laatste PHONE_ACTIVE_WINDOW s beelden stuurde en de robot niet zelf het
+    pad volgt (die heeft de heading van de robotcamera nodig)."""
+    if not PAUSE_ROBOT_YOLO_FOR_PHONE or path_follower.active:
+        return False
+    last = phone_segmentation.last_at
+    return bool(last) and time.monotonic() - last < PHONE_ACTIVE_WINDOW
 
 
 @app.route("/segment", methods=["POST"])
@@ -3307,7 +3486,7 @@ def segment():
         return jsonify({"ok": False, "error": "geen geldig JPEG-beeld"}), 400
 
     try:
-        heading, outline, ms = phone_segmentation.segment(image)
+        heading, outline, ms, timings = phone_segmentation.segment(image)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -3316,7 +3495,10 @@ def segment():
         "frame_id": request.args.get("frame_id"),
         "path": heading is not None,
         "ms": round(ms, 1),
-        "gpu": phone_segmentation.gpu,
+        "timings": {k: v for k, v in timings.items() if k != "detecties"},
+        "detections": timings.get("detecties", []),
+        "model": phone_segmentation.model_name,
+        "gpu": inference_device() == 0,
         "masks": [outline] if outline else [],
     })
 
@@ -3332,9 +3514,9 @@ def add_guidance_cors(response):
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
         response.headers["Access-Control-Allow-Private-Network"] = "true"
-        # Zonder dit vraagt Chrome om de 5 s opnieuw een preflight: een extra
-        # heen-en-weer over de USB-kabel voor elk beeld dat dan vertrekt
-        response.headers["Access-Control-Max-Age"] = "7200"
+        # Zonder Max-Age onthoudt Chrome de preflight maar 5 s, en kost elke
+        # paar beelden een extra OPTIONS-aanvraag door de adb-tunnel.
+        response.headers["Access-Control-Max-Age"] = "600"
         response.headers["Vary"] = "Origin"
     return response
 
@@ -3705,6 +3887,11 @@ def main():
     ready.wait(timeout=30)
 
     print("Open op je smartphone: http://<ip-van-deze-pc>:%d/" % WEB_PORT, flush=True)
+
+    # Standaard praat de Flask-server HTTP/1.0 en sluit hij na elk antwoord de
+    # verbinding. Via adb reverse kost een nieuwe verbinding telkens honderden
+    # ms; met HTTP/1.1 hergebruikt de gsm dezelfde verbinding voor /guidance.
+    WSGIRequestHandler.protocol_version = "HTTP/1.1"
 
     try:
         app.run(host=WEB_HOST, port=WEB_PORT, threaded=True, use_reloader=False)

@@ -42,12 +42,39 @@ de webserver van stayontrails.ehb.be, niet in deze repository.
 
 ```bash
 cd ~ && git clone https://github.com/Lukasehb/UnitreeRoboticsProject2026-2027.git JetsonLukas
-pip install flask opencv-python numpy ultralytics unitree_webrtc_connect cryptography
+pip3 install flask opencv-python ultralytics cryptography
+pip3 install -U unitree_webrtc_connect      # nieuwe versie nodig voor recente Go2-firmware
+pip3 install "numpy<2"                      # de NVIDIA-PyTorch werkt niet met numpy 2
 ```
 
 Gebruik op de Jetson de **PyTorch-versie van NVIDIA voor JetPack** (met CUDA).
 Met de gewone `pip`-torch rekent YOLO op de CPU, en dat is ongeveer tien keer
 trager.
+
+Na elke `pip3 install -U ...` opnieuw nakijken dat numpy onder versie 2 blijft:
+`python3 -c "import numpy; print(numpy.__version__)"`. Anders geeft de camera
+de fout `Numpy is not available`.
+
+### Het IP-adres van de Go2 instellen
+
+`urlcontrol.py` draait als service (`unitree-urlcontrol.service`) en verbindt
+met de Go2 op `ROBOT_IP`. Het netwerk kan de Go2 bij elke herstart een ander
+adres geven: zoek het op (bv. met Advanced IP Scanner, of op de gsm bij de
+verbonden apparaten van de hotspot) en zet het in een aanvulling op de service:
+
+```bash
+sudo mkdir -p /etc/systemd/system/unitree-urlcontrol.service.d
+printf '[Service]\nEnvironment=ROBOT_IP=<ip-van-de-go2>\n' | sudo tee /etc/systemd/system/unitree-urlcontrol.service.d/robot-ip.conf
+sudo systemctl daemon-reload
+systemctl show unitree-urlcontrol.service -p Environment   # controle
+```
+
+Heeft de Go2 firmware 1.1.15 of nieuwer en meldt de verbinding
+`AesKeyRequiredError`, voeg dan ook `Environment=ROBOT_AES_KEY=<32 hex-tekens>`
+toe (ophalen met `unitree-fetch-aes-key --device-type Go2 --email <account> --sn <serienummer>`
+via het Unitree-account waaraan de Go2 gekoppeld is). Zet die sleutel nooit in
+de repository, en maak het bestand enkel leesbaar voor root:
+`sudo chmod 600 .../robot-ip.conf`.
 
 ### Sneller model met TensorRT
 
@@ -65,15 +92,34 @@ yolo export model=laerbeekbos.pt format=engine half=True device=0   # duurt ~5-1
 
 ## Starten
 
-### Met de echte Go2
+### Met de echte Go2, stap voor stap
 
-`urlcontrol.py` draait als service, `unitree-urlcontrol.service`, en verbindt
-met de Go2 op `ROBOT_IP` (standaard `10.2.172.215`).
+1. **Netwerk.** De Go2, de Jetson en (als je geen USB gebruikt) de gsm zitten op
+   hetzelfde netwerk. Buiten kan dat de hotspot van de gsm zijn, met mobiele
+   data aan voor FLEPOS. Kijk het adres van de Jetson na met `hostname -I`, en
+   dat van de Go2 zoals hierboven.
+2. **Go2 aan**, en wacht 1–2 minuten tot hij op het netwerk zit:
+   `ping -c 3 <ip-van-de-go2>`.
+3. **urlcontrol.py (re)starten.** De service start vanzelf bij het opstarten
+   van de Jetson, maar verbindt enkel bij het starten met de Go2:
+   ```bash
+   sudo systemctl restart unitree-urlcontrol.service
+   journalctl -u unitree-urlcontrol.service -f   # wacht op "Verbonden met de Go2" en "Running on ...:8080" (~40 s)
+   curl http://localhost:8080/status             # "connected": true
+   ```
+   De Go2 aanvaardt maar één WebRTC-verbinding: sluit de Unitree-app en andere
+   scripts af. Na een herstart van de service of de Jetson houdt de Go2 de
+   oude verbinding soms nog vast; herstart dan ook de Go2 (zie *Problemen
+   oplossen*). Herstart de service dus niet onnodig.
+4. **StayOnTrails op de Jetson** (start niet vanzelf; laat de terminal open):
+   ```bash
+   cd ~/JetsonLukas/stayontrails && python3 freewalkFlask.py
+   ```
+5. **De gsm aansluiten** (USB, zie hieronder) of op hetzelfde netwerk zetten.
+6. Verder met een van de *Werkwijzen*.
 
-```bash
-sudo systemctl restart unitree-urlcontrol.service
-journalctl -u unitree-urlcontrol.service -f     # wacht op "Running on ...:8080" (~40 s)
-```
+`urlcontrol.py` laat een Go2 met recente firmware in de bewegingsmodus `mcf`
+staan; de log toont `Bewegingsmodus van de Go2: mcf`.
 
 ### Met de simulator (zonder Go2)
 
@@ -98,7 +144,29 @@ dat geopend is met `?remote=CODE`.
 
 Op een Jetson werkt de snap-versie van Chromium niet. Een Chromium zonder snap
 installeer je met `npx playwright install chromium`; geef het pad dan mee met
-`--chrome`.
+`--chrome`. Staat er ook een oudere Node via nvm, start dan met `/usr/bin/node`.
+
+**Een route testen in de simulator** (zonder Go2 en zonder RTK). Gebruik de open
+vloer (`SIM_LANE=free`, de standaardwereld) en leg de oorsprong van de nep-GPS
+op het eerste punt van de route, zodat de robot daar start. Die vloer is maar
+zo'n 14 m breed; een grotere route kan je voor de test verkleinen.
+
+```bash
+# terminal 2: StayOnTrails met de GPS van de simulator
+cd ~/JetsonLukas/stayontrails && FREEWALK_SIM_GPS=1 python3 freewalkFlask.py
+
+# terminal 3: urlcontrol met de simulator, gestart op het eerste routepunt
+cd ~/JetsonLukas/Unitree
+BOTOPIA_DIR=~/robotSimulatorAPI/python ROBOT_SIM=local SIM_LANE=free \
+  SIM_ORIGIN_LAT=<lat van punt 1> SIM_ORIGIN_LON=<lon van punt 1> python3 urlcontrol.py
+
+curl http://localhost:8080/cmd/stand_up
+curl "http://localhost:8080/route/start?slug=<slug>&mode=gps"
+```
+
+Meekijken kan met `http://localhost:8780/api/envs/<id>/frame?view=scene&width=960`
+(het id staat in `http://localhost:8780/api/envs`), of door de simulator te
+starten met `--show`.
 
 ### De gsm aansluiten (USB)
 
@@ -140,17 +208,59 @@ vertraagt hij.
 
 ### Een route afleggen met RTK-GPS
 
-1. Zet de route als JSON in `stayontrails/paths/<slug>.json` op de Jetson.
-2. Start freewalkFlask, zonder `FREEWALK_SIM_GPS`:
-   `cd ~/JetsonLukas/stayontrails && python3 freewalkFlask.py`
-3. Op de gsm: verbind de RTK-ontvanger (ArduSimple simpleRTK2B) via bluetooth
-   in **GNSS Master**, met FLEPOS-correcties (*Send GGA* aan) en **Mock
-   Location** aan. Open `https://localhost:5003` en laat die pagina open: ze
-   stuurt de positie elke seconde naar `/api/gps`.
-4. Start de route: `curl "http://localhost:8080/route/start?slug=<slug>"`
+Zo komt de GPS bij de Jetson:
 
-De camera houdt de robot op het pad. De GPS zet het volgende punt actief en
-stuurt bij als de looprichting te ver afwijkt.
+```
+RTK-ontvanger ─bluetooth─▶ gsm (GNSS Master, mock location) ─▶ Chrome op :5003
+  ─elke seconde, wifi of USB─▶ freewalkFlask (/api/gps) ─▶ urlcontrol.py ─▶ Go2
+```
+
+1. **De route** staat als JSON in `stayontrails/paths/<slug>.json` op de Jetson
+   (urlcontrol.py leest de routes daar, niet van stayontrails.ehb.be). Kies
+   punten minstens 5 m uit elkaar en een aankomststraal van 1–2 m.
+2. **freewalkFlask** draait, zonder `FREEWALK_SIM_GPS` (zie *Starten*).
+3. **RTK op de gsm**, onder open lucht:
+   - de RTK-ontvanger (ArduSimple simpleRTK2B, verschijnt als `BT+BLE_Bridge_…`)
+     verbonden in **GNSS Master**, met FLEPOS-correcties (*Send GGA* aan);
+   - wacht tot GNSS Master **RTK Fix** toont;
+   - **Mock Location** aan, en GNSS Master gekozen bij Ontwikkelaarsopties →
+     *App voor neplocatie selecteren*;
+   - zet bij Locatie → Locatieservices *Google-locatienauwkeurigheid*, wifi- en
+     bluetooth-scannen uit, anders schuift Android zijn eigen locatie (~15 m)
+     tussen die van de ontvanger.
+4. **De positie doorsturen.** Open op de gsm `https://<ip-van-de-jetson>:5003`
+   (of `https://localhost:5003` via USB), druk op **Start wandelen** en sta de
+   locatie toe. Pas dan stuurt de pagina de positie; laat ze open met het
+   scherm aan. Controle op de Jetson:
+   ```bash
+   curl -k https://127.0.0.1:5003/api/gps    # "fix": true, accuracy_m rond 0.02 bij RTK Fix, age_s < 2
+   ```
+5. **De Go2 klaarzetten:** antenne bovenop de robot, met open lucht erboven,
+   robot op het startpunt, vrije ruimte rond de route.
+   `curl http://localhost:8080/cmd/stand_up`
+6. **Starten**, in een van twee modi:
+   ```bash
+   curl "http://localhost:8080/route/start?slug=<slug>&mode=gps"    # GPS-modus
+   curl "http://localhost:8080/route/start?slug=<slug>"             # padmodus (camera)
+   journalctl -u unitree-urlcontrol.service -f                      # meekijken
+   curl http://localhost:8080/route/stop                            # stoppen
+   ```
+   Op `http://<ip-van-de-jetson>:8080/` kan het ook: kies de route, vink
+   **GPS-modus** aan en druk op **volg route**.
+
+**Padmodus** (standaard): de camera houdt de robot op het pad, de GPS zet het
+volgende punt actief en stuurt grof bij. Werkt op een pad dat het model
+herkent (bv. een bospad).
+
+**GPS-modus** (`mode=gps`): geen camera; de robot loopt rechtstreeks naar elk
+punt. Hij leert zijn looprichting uit de RTK-posities (~1 m rechtdoor), draait
+ter plaatse als het volgende punt meer dan 45° opzij ligt, en stuurt anders al
+lopend bij, aan 0,3 m/s. Hij start enkel bij een nauwkeurigheid van 1 m of
+beter, negeert losse onnauwkeurige posities, staat stil na 3 s zonder goede
+positie en stopt na 15 s. Hij ontwijkt geen obstakels: loop ernaast.
+
+Binnen werkt de GPS-modus niet: zonder open lucht geen RTK Fix (binnen
+5–15 m of slechter), en dan weigert hij te starten.
 
 ## Endpoints van urlcontrol.py (poort 8080)
 
@@ -163,7 +273,7 @@ stuurt bij als de looprichting te ver afwijkt.
 | `POST /segment` | JPEG van de gsm → `{heading, path, masks, ms, timings, gpu, …}` |
 | `GET /timings` | Rekentijden van YOLO (gsm en robot), ook om de 5 s in de log |
 | `GET /cmd/<commando>` | Bv. `stand_up`, `stand_down`, `follow`, `hello` |
-| `GET /route/paths`, `/route/start?slug=`, `/route/stop` | Een GPS-route afleggen |
+| `GET /route/paths`, `/route/start?slug=&mode=`, `/route/stop` | Een GPS-route afleggen (`mode=path` of `gps`) |
 | `GET /model?name=`, `/confidence?value=` | Model en confidence kiezen |
 | `GET /heading?heading=` | De robot naar een richting draaien |
 
@@ -178,7 +288,8 @@ toe (`GUIDANCE_ORIGIN`).
 | `ROBOT_AES_KEY` | leeg | Sleutel per robot, nodig vanaf Go2-firmware 1.1.15 (`unitree-fetch-aes-key`) |
 | `ROBOT_SIM` | leeg | `local`, `http://<ip>:8780` of een sessiecode: de simulator gebruiken |
 | `BOTOPIA_DIR` | leeg | Map met `botopia.py` uit robotSimulatorAPI |
-| `SIM_WORLD` / `SIM_LANE` | – / `track` | Wereld (`park`) en startplaats in de simulator |
+| `SIM_WORLD` / `SIM_LANE` | – / `track` | Wereld (`park`) en startplaats in de simulator (`free` = open vloer) |
+| `SIM_ORIGIN_LAT` / `SIM_ORIGIN_LON` | `50.841746` / `4.322936` | GPS-positie van de oorsprong van de simulator |
 | `SIM_GPS_NOISE_M` | `0` | Ruis op de nep-GPS van de simulator, in meter |
 | `USE_CAMERA` | `1` | `0` = zonder robotcamera en YOLO |
 | `PAUSE_ROBOT_YOLO_FOR_PHONE` | `1` | Robot-YOLO pauzeren zolang de gsm beelden stuurt |
@@ -187,6 +298,37 @@ toe (`GUIDANCE_ORIGIN`).
 | `FREEWALK_SIM_GPS` | `0` | freewalkFlask: GPS van de simulator in plaats van de gsm |
 
 ## Problemen oplossen
+
+**Verbinding met de Go2** (`"connected": false`, zie
+`journalctl -u unitree-urlcontrol.service -n 40 --no-pager | grep -iv werkzeug`):
+
+- **`not exposing a signaling port` of `Could not get SDP from the peer`:**
+  verkeerd IP-adres (kijk `systemctl show unitree-urlcontrol.service -p Environment`
+  na), of de Go2 staat (nog) niet op het netwerk. Test met `ping` en met
+  `curl -s -o /dev/null -w "%{http_code}" http://<ip-van-de-go2>:9991/con_notify`
+  (200 = de Go2 is klaar).
+- **`Data channel setup timed out` (`ice=checking`):** een andere client houdt
+  de enige verbinding bezet, of de Go2 houdt een oude verbinding vast. Sluit de
+  Unitree-app en andere scripts af, en herstart proper:
+  `sudo systemctl stop unitree-urlcontrol.service`, Go2 uit en aan, 2 minuten
+  wachten, `sudo systemctl start unitree-urlcontrol.service`.
+- **`AesKeyRequiredError` / `AesKeyRejectedError`:** zie `ROBOT_AES_KEY` bij
+  *Het IP-adres van de Go2 instellen*.
+- **De camera geeft `Numpy is not available`:** `pip3 install "numpy<2"` en de
+  service herstarten.
+
+**GPS en route:**
+
+- **`geen verse GPS van de gsm`:** draait freewalkFlask, en is op de pagina
+  `:5003` op **Start wandelen** gedrukt? Staat het scherm aan?
+- **`GPS niet nauwkeurig genoeg voor de GPS-modus`:** geen RTK Fix. Ga naar
+  buiten onder open lucht en wacht tot GNSS Master *RTK Fix* toont.
+- **`accuracy_m` springt tussen ~0,02 m en ~15 m:** Android mengt zijn eigen
+  locatie erdoor; zet *Google-locatienauwkeurigheid* uit (zie hierboven).
+- **De route stopt meteen met `bestemming bereikt`:** de punten liggen dichter
+  bij elkaar dan de aankomststraal.
+
+**Gsm en Jetson:**
 
 - **`adb devices` toont `unauthorized`, en er komt geen vraag op de gsm:** kijk
   of `~/.android/adbkey.pub` bestaat. Sommige adb-versies van Ubuntu maken

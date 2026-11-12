@@ -489,11 +489,14 @@ def detect_markers(frame):
     if ids is None or len(ids) == 0:
         return []
 
+    # Afhankelijk van de OpenCV-versie zijn de id's [[3], [7]] of [3, 7]
+    ids = np.asarray(ids).reshape(-1)
+
     markers = []
     for marker_id, marker_corners in zip(ids, corners):
-        points = np.round(marker_corners.reshape((4, 2))).astype(np.int32)
+        points = np.round(np.asarray(marker_corners).reshape((4, 2))).astype(np.int32)
         markers.append({
-            "id": int(marker_id[0]),
+            "id": int(marker_id),
             "points": points,
             "area": float(cv2.contourArea(points)),
         })

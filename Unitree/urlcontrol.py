@@ -4025,13 +4025,21 @@ def run_asyncio_loop(loop, ready):
         )
         await conn.connect()
 
-        # Zorg dat de robot in normale modus staat
+        # In welke bewegingsmodus staat de robot? Oudere firmware heeft
+        # "normal" en "ai": vanuit "ai" zetten we hem terug op "normal".
+        # Firmware vanaf 1.1.7 staat in "mcf" en kent geen "normal" meer;
+        # die laten we met rust, anders wil hij daarna niet meer rechtstaan.
+        # Move, StandUp en RecoveryStand hebben in beide hetzelfde nummer.
         response = await conn.datachannel.pub_sub.publish_request_new(
             RTC_TOPIC["MOTION_SWITCHER"],
             {"api_id": 1001}
         )
-        data = json.loads(response["data"]["data"])
-        if data["name"] != "normal":
+        try:
+            mode = json.loads(response["data"]["data"]).get("name", "")
+        except (KeyError, TypeError, ValueError):
+            mode = ""
+        print("Bewegingsmodus van de Go2: %s" % (mode or "onbekend"), flush=True)
+        if mode == "ai":
             await conn.datachannel.pub_sub.publish_request_new(
                 RTC_TOPIC["MOTION_SWITCHER"],
                 {"api_id": 1002, "parameter": {"name": "normal"}}

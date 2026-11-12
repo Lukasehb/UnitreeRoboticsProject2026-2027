@@ -39,6 +39,12 @@ from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD, VUI_COLOR
 logging.basicConfig(level=logging.FATAL)
 
 ROBOT_IP = os.environ.get("ROBOT_IP", "10.2.172.215")   # of: ROBOT_IP=x.x.x.x python3 urlcontrol.py
+# Go2-firmware vanaf 1.1.15 versleutelt de verbinding met een sleutel per
+# robot (32 hex-tekens). Haal ze één keer op met je Unitree-account:
+#   unitree-fetch-aes-key --device-type Go2 --email <mail> --sn <serienummer>
+# en geef ze mee als ROBOT_AES_KEY. Nooit in de code zetten: ze hoort bij jouw
+# robot en account. Leeg = oudere firmware, geen sleutel nodig.
+ROBOT_AES_KEY = os.environ.get("ROBOT_AES_KEY", "").strip() or None
 # Sessiecode van de Botopia-simulator (zie simgo2.py). Leeg = de echte Go2.
 ROBOT_SIM = os.environ.get("ROBOT_SIM", "").strip()     # ROBOT_SIM=729AM9 python3 urlcontrol.py
 WEB_HOST = "0.0.0.0"
@@ -4014,7 +4020,8 @@ def run_asyncio_loop(loop, ready):
 
         conn = UnitreeWebRTCConnection(
             WebRTCConnectionMethod.LocalSTA,
-            ip=ROBOT_IP
+            ip=ROBOT_IP,
+            aes_128_key=ROBOT_AES_KEY,
         )
         await conn.connect()
 

@@ -175,6 +175,7 @@ toe (`GUIDANCE_ORIGIN`).
 | Variabele | Standaard | Betekenis |
 |---|---|---|
 | `ROBOT_IP` | `10.2.172.215` | IP-adres van de Go2 |
+| `ROBOT_AES_KEY` | leeg | Sleutel per robot, nodig vanaf Go2-firmware 1.1.15 (`unitree-fetch-aes-key`) |
 | `ROBOT_SIM` | leeg | `local`, `http://<ip>:8780` of een sessiecode: de simulator gebruiken |
 | `BOTOPIA_DIR` | leeg | Map met `botopia.py` uit robotSimulatorAPI |
 | `SIM_WORLD` / `SIM_LANE` | – / `track` | Wereld (`park`) en startplaats in de simulator |

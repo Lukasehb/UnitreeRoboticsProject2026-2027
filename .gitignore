@@ -25,3 +25,6 @@ authtokens.csv
 # Jetson waar ze gemaakt zijn (yolo export ... format=engine)
 /signaling/models/*.engine
 /signaling/models/*.onnx
+
+# Python bytecode, overal
+__pycache__/

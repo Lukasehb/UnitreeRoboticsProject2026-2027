@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./**/venv/**)",
+      "Read(./**/__pycache__/**)",
+      "Read(./**/*.pyc)",
+      "Read(./**/*.pt)",
+      "Read(./**/*.onnx)",
+      "Read(./**/*.engine)",
+      "Read(./voices/**)",
+      "Read(./Unitree/Videos/**)",
+      "Read(./Unitree/fotos/**)",
+      "Read(./Unitree/urlcontrolv1.py)",
+      "Read(./stayontrails/static/**)",
+      "Read(./faceassist/class/**)",
+      "Read(./faceassist/known/**)",
+      "Read(./faceassist/to_check/**)",
+      "Read(./faceassist/extracted_faces/**)",
+      "Read(./faceassist/qr_codes/**)"
+    ]
+  }
+}

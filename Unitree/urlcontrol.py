@@ -183,6 +183,7 @@ ROUTE_GPS_FULL_TURN = 45.0    # graden afwijking waarbij we al lopend op volle b
 ROUTE_GPS_TURN_SPEED = 0.3    # rad/s bijsturen al lopend; traag, want de GPS komt maar 1x per s
 ROUTE_GPS_MAX_ACCURACY = 1.0  # m: slechtere fix (geen RTK) = stilstaan en wachten
 ROUTE_GPS_WAIT_ACCURACY = 15.0  # s wachten op een nauwkeurige fix voor we stoppen
+ROUTE_GPS_GOOD_MAX_AGE = 3.0  # s na de laatste nauwkeurige fix: daarna stilstaan tot er weer een is
 
 # Het pad volgen: dit loopt door tot er iets is om voor te stoppen
 FOLLOW_DEADBAND = 3.0         # graden verschil waarbinnen we niet bijsturen
@@ -2343,6 +2344,7 @@ class RouteFollower:
         last_fix = None
         gps_lost_since = None
         self._bad_since = None
+        self._good_at = time.monotonic()
         try:
             while not self._stop.is_set():
                 if robot.stopped:
@@ -2365,9 +2367,16 @@ class RouteFollower:
                     fix_at = time.time() - float(gps.get("age_s") or 0.0)
                     if last_fix is None or abs(fix_at - last_fix) > 0.05:
                         last_fix = fix_at
-                        command = self._gps_step(gps)
+                        step = self._gps_step(gps)
                         if not self.active:
                             break
+                        if step is not None:  # None = losse slechte fix, negeren
+                            command = step
+
+                # Geen nauwkeurige fix meer sinds een tijdje: niet blind
+                # doorlopen op het vorige commando
+                if time.monotonic() - self._good_at > ROUTE_GPS_GOOD_MAX_AGE:
+                    command = (0.0, 0.0)
 
                 x, z = command
                 robot.note_command("route %d/%d" % (min(self.index + 1, len(self.points)),
@@ -2384,21 +2393,24 @@ class RouteFollower:
             pass
 
     def _gps_step(self, gps):
-        """Eén nieuwe GPS-fix verwerken; geeft het volgende (x, z) terug."""
+        """Eén nieuwe GPS-fix verwerken; geeft het volgende (x, z) terug, of
+        None om een losse onnauwkeurige fix te negeren."""
         now = time.monotonic()
         lat, lon = gps["lat"], gps["lon"]
-        self.accuracy = gps.get("accuracy_m")
+        accuracy = gps.get("accuracy_m")
 
-        # Zonder RTK springt de positie meters heen en weer: dan is elke
-        # looprichting gegokt. Stilstaan en wachten tot het beter wordt.
-        if self.accuracy is not None and self.accuracy > ROUTE_GPS_MAX_ACCURACY:
+        # Een onnauwkeurige fix (geen RTK) negeren we: Android schuift soms
+        # zijn eigen locatie (wifi, zendmasten, ~15 m) tussen die van de
+        # RTK-ontvanger. Blijft het zo, dan staat _run_gps na
+        # ROUTE_GPS_GOOD_MAX_AGE stil en stoppen we na ROUTE_GPS_WAIT_ACCURACY.
+        if accuracy is not None and accuracy > ROUTE_GPS_MAX_ACCURACY:
             self._bad_since = self._bad_since or now
-            self._track = []
-            self.course = None
             if now - self._bad_since > ROUTE_GPS_WAIT_ACCURACY:
-                self.stop("GPS niet nauwkeurig genoeg (%.1f m)" % self.accuracy)
-            return (0.0, 0.0)
+                self.stop("GPS niet nauwkeurig genoeg (%.1f m)" % accuracy)
+            return None
         self._bad_since = None
+        self._good_at = now
+        self.accuracy = accuracy
 
         target_lat, target_lon, _ = self.points[self.index]
         self.distance = haversine_m(lat, lon, target_lat, target_lon)

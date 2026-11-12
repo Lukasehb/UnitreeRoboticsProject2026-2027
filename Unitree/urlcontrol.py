@@ -154,7 +154,9 @@ MAX_RULE_DISTANCE = 10.0      # grens op de afstand waarop een regel afgaat
 # De gsm zit op/bij de robot en draait de stayontrails-pagina; die stuurt zijn
 # GPS naar /api/gps. De camera blijft het pad volgen, de GPS beslist wanneer
 # een routepunt bereikt is en of we nog de goede kant op lopen.
-FREEWALK_URL = os.environ.get("FREEWALK_URL", "https://localhost:5003")
+# 127.0.0.1 en niet localhost: dat probeert eerst IPv6, en op Windows kost
+# dat ~2 s per aanvraag (de server luistert enkel op IPv4)
+FREEWALK_URL = os.environ.get("FREEWALK_URL", "https://127.0.0.1:5003")
 ROUTE_POLL_INTERVAL = 1.0     # s tussen twee GPS-uitlezingen
 ROUTE_GPS_MAX_AGE = 5.0       # s zonder verse GPS voor we stoppen
 ROUTE_MAX_ACCURACY = 15.0     # m: slechtere fixes tellen niet mee voor aankomst
@@ -163,6 +165,18 @@ ROUTE_GPS_STEERING = True     # bijsturen als de looprichting ver van het volgen
 ROUTE_TURN_THRESHOLD = 50.0   # graden afwijking waarboven we bijsturen
 ROUTE_MAX_CORRECTION = 90.0   # nooit meer dan dit in één correctie draaien
 ROUTE_CORRECTION_COOLDOWN = 10.0  # s tussen twee correcties
+
+# GPS-modus (/route/start?mode=gps): geen camera, de robot stuurt rechtstreeks
+# naar het volgende routepunt. Zijn looprichting leert hij uit de GPS-posities
+# terwijl hij loopt, dus dit vraagt RTK-precisie.
+ROUTE_GPS_SPEED = 0.3         # m/s vooruit
+ROUTE_GPS_INTERVAL = 0.2      # s tussen twee move-commando's (de Go2 stopt na ~1 s zonder)
+ROUTE_GPS_COURSE_M = 1.0      # m verplaatsing nodig om de looprichting te bepalen
+ROUTE_GPS_TURN_IN_PLACE = 45.0  # graden: ligt het punt verder opzij, eerst ter plaatse draaien
+ROUTE_GPS_FULL_TURN = 45.0    # graden afwijking waarbij we al lopend op volle bijstuursnelheid zitten
+ROUTE_GPS_TURN_SPEED = 0.3    # rad/s bijsturen al lopend; traag, want de GPS komt maar 1x per s
+ROUTE_GPS_MAX_ACCURACY = 1.0  # m: slechtere fix (geen RTK) = stilstaan en wachten
+ROUTE_GPS_WAIT_ACCURACY = 15.0  # s wachten op een nauwkeurige fix voor we stoppen
 
 # Het pad volgen: dit loopt door tot er iets is om voor te stoppen
 FOLLOW_DEADBAND = 3.0         # graden verschil waarbinnen we niet bijsturen
@@ -2094,7 +2108,11 @@ class RouteFollower:
     aankomststraal komen, stopt aan het einde of als de GPS wegvalt, en stuurt
     bij als de gelopen richting duidelijk niet naar het volgende punt wijst.
     Elk ander commando, een noodstop of het stoppen van de camera-volger zet
-    de route ook stil."""
+    de route ook stil.
+
+    In de GPS-modus (mode="gps") doet de camera niet mee: de robot stuurt
+    rechtstreeks naar het volgende punt, zie _run_gps. Handig waar geen pad
+    te herkennen valt, of voor korte stukken met scherpe bochten."""
 
     def __init__(self):
         self._thread = None
@@ -2111,16 +2129,19 @@ class RouteFollower:
         self.bearing = None
         self.course = None
         self.accuracy = None
+        self.mode = "path"            # "path": camera stuurt, "gps": de GPS stuurt
         self._track = []              # (monotonic, lat, lon) sinds de laatste correctie
         self._last_correction = 0.0
 
     # -- starten en stoppen --------------------------------------------------
 
-    def start(self, slug):
+    def start(self, slug, mode="path"):
         if self.active:
             return {"ok": False, "error": "er loopt al een route"}
         if not robot.connected:
             return {"ok": False, "error": "geen verbinding met de robot"}
+        if mode not in ("path", "gps"):
+            return {"ok": False, "error": "onbekende modus: %s (path of gps)" % mode}
 
         try:
             payload = freewalk_get("/?action=load_path&slug=" + urllib.parse.quote(slug))
@@ -2138,7 +2159,8 @@ class RouteFollower:
         # De camera-volger heeft een vers segmentatiebeeld nodig; zonder zou de
         # route meteen stoppen met een vage melding. Zeg dus wat er schort.
         camera = segmentation.snapshot()
-        if camera["status"] != "actief" or camera["age"] is None or camera["age"] > HEADING_MAX_AGE:
+        if mode == "path" and (camera["status"] != "actief" or camera["age"] is None
+                               or camera["age"] > HEADING_MAX_AGE):
             reason = {
                 "model laden": "het model wordt nog geladen, wacht even",
                 "wachten op beeld": "er komt geen camerabeeld van de robot binnen",
@@ -2149,8 +2171,14 @@ class RouteFollower:
         gps = self._gps()
         if gps is None:
             return {"ok": False, "error": "geen verse GPS van de gsm: open de stayontrails-pagina"}
+        accuracy = gps.get("accuracy_m")
+        if mode == "gps" and accuracy is not None and accuracy > ROUTE_GPS_MAX_ACCURACY:
+            return {"ok": False, "error": "GPS niet nauwkeurig genoeg voor de GPS-modus: "
+                                          "%.1f m (max %.1f m, wacht op RTK Fix)"
+                                          % (accuracy, ROUTE_GPS_MAX_ACCURACY)}
 
         self.slug = path.get("slug", slug)
+        self.mode = mode
         self.name = path.get("name", slug)
         self.points = points
         self.radius = float(path.get("arrivalRadiusMeters") or 3)
@@ -2163,11 +2191,18 @@ class RouteFollower:
         self.changes += 1
         self._stop.clear()
 
-        path_follower.start()         # de camera loopt mee op het pad
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        if mode == "gps":
+            robot.resume()            # een noodstop van daarnet mag dit niet tegenhouden
+            path_follower.stop("route in GPS-modus")
+            target = self._run_gps
+        else:
+            path_follower.start()     # de camera loopt mee op het pad
+            target = self._run
+        self._thread = threading.Thread(target=target, daemon=True)
         self._thread.start()
-        print("Route gestart: %s (%d punten)" % (self.name, len(points)), flush=True)
-        return {"ok": True, "route": self.name, "points": len(points)}
+        print("Route gestart: %s (%d punten, %s-modus)" % (self.name, len(points), mode),
+              flush=True)
+        return {"ok": True, "route": self.name, "points": len(points), "mode": mode}
 
     def stop(self, reason):
         if not self.active:
@@ -2177,7 +2212,8 @@ class RouteFollower:
         self.changes += 1
         self._stop.set()
         print("Route gestopt: " + reason, flush=True)
-        path_follower.stop("route: " + reason)
+        if self.mode == "path":
+            path_follower.stop("route: " + reason)
 
     # -- GPS -----------------------------------------------------------------
 
@@ -2285,6 +2321,141 @@ class RouteFollower:
             if resume and self.active and not robot.stopped:
                 path_follower.start()
 
+    # -- GPS-modus -----------------------------------------------------------
+
+    def _run_gps(self):
+        """Rechtstreeks van punt naar punt, enkel op GPS.
+
+        De Go2 stopt na ~1 s zonder move-commando, dus we herhalen het
+        laatste commando om de ROUTE_GPS_INTERVAL s. Telkens er een nieuwe
+        GPS-fix is (de gsm stuurt er één per seconde), bepaalt _gps_step het
+        volgende commando."""
+        command = (0.0, 0.0)          # (vooruit m/s, draaien rad/s; positief = links)
+        last_fix = None
+        gps_lost_since = None
+        self._bad_since = None
+        try:
+            while not self._stop.is_set():
+                if robot.stopped:
+                    self.stop("noodstop")
+                    break
+                if not robot.connected:
+                    self.stop("geen verbinding")
+                    break
+
+                gps = self._gps()
+                if gps is None:
+                    command = (0.0, 0.0)
+                    gps_lost_since = gps_lost_since or time.monotonic()
+                    if time.monotonic() - gps_lost_since > ROUTE_GPS_MAX_AGE:
+                        self.stop("GPS weggevallen")
+                        break
+                else:
+                    gps_lost_since = None
+                    # Een nieuwe fix herkennen we aan zijn ontvangstmoment
+                    fix_at = time.time() - float(gps.get("age_s") or 0.0)
+                    if last_fix is None or abs(fix_at - last_fix) > 0.05:
+                        last_fix = fix_at
+                        command = self._gps_step(gps)
+                        if not self.active:
+                            break
+
+                x, z = command
+                robot.note_command("route %d/%d" % (min(self.index + 1, len(self.points)),
+                                                     len(self.points)))
+                robot.move(x=x, y=0, z=z)
+                self._stop.wait(ROUTE_GPS_INTERVAL)
+        except Exception as exc:
+            self.stop("fout: " + str(exc))
+
+        try:
+            if not robot.stopped:
+                robot.move(x=0, y=0, z=0)
+        except Exception:
+            pass
+
+    def _gps_step(self, gps):
+        """Eén nieuwe GPS-fix verwerken; geeft het volgende (x, z) terug."""
+        now = time.monotonic()
+        lat, lon = gps["lat"], gps["lon"]
+        self.accuracy = gps.get("accuracy_m")
+
+        # Zonder RTK springt de positie meters heen en weer: dan is elke
+        # looprichting gegokt. Stilstaan en wachten tot het beter wordt.
+        if self.accuracy is not None and self.accuracy > ROUTE_GPS_MAX_ACCURACY:
+            self._bad_since = self._bad_since or now
+            self._track = []
+            self.course = None
+            if now - self._bad_since > ROUTE_GPS_WAIT_ACCURACY:
+                self.stop("GPS niet nauwkeurig genoeg (%.1f m)" % self.accuracy)
+            return (0.0, 0.0)
+        self._bad_since = None
+
+        target_lat, target_lon, _ = self.points[self.index]
+        self.distance = haversine_m(lat, lon, target_lat, target_lon)
+        self.bearing = bearing_deg(lat, lon, target_lat, target_lon)
+
+        if self.distance <= self.radius:
+            self.index += 1
+            self.changes += 1
+            print("Routepunt %d bereikt" % self.index, flush=True)
+            if self.index >= len(self.points):
+                self.stop("bestemming bereikt")
+                robot.note_command("route klaar")
+                return (0.0, 0.0)
+            target_lat, target_lon, _ = self.points[self.index]
+            self.distance = haversine_m(lat, lon, target_lat, target_lon)
+            self.bearing = bearing_deg(lat, lon, target_lat, target_lon)
+
+        self._track.append((now, lat, lon))
+        self._track = [item for item in self._track if now - item[0] <= 20.0]
+        self.course = self._gps_course()
+
+        if self.course is None:
+            # Nog geen looprichting: rechtdoor stappen tot we ze kennen
+            return (ROUTE_GPS_SPEED, 0.0)
+
+        error = angle_diff(self.bearing, self.course)    # positief = rechts
+        if abs(error) > ROUTE_GPS_TURN_IN_PLACE:
+            print("Route: koers %.0f, doel %.0f, draai %+.0f graden ter plaatse"
+                  % (self.course, self.bearing, error), flush=True)
+            self._turn_in_place(error)
+            self._track = []          # na het draaien de looprichting opnieuw leren
+            self.course = None
+            return (ROUTE_GPS_SPEED, 0.0)
+
+        share = clamp(error / ROUTE_GPS_FULL_TURN, -1.0, 1.0)
+        z = -share * ROUTE_GPS_TURN_SPEED                   # positieve z is links
+        x = ROUTE_GPS_SPEED * (1.0 - 0.5 * abs(share))
+        return (x, z)
+
+    def _gps_course(self):
+        """Looprichting uit de recente fixes: van de jongste fix die minstens
+        ROUTE_GPS_COURSE_M achter ons ligt naar de laatste. None als we nog
+        niet ver genoeg gelopen hebben."""
+        if len(self._track) < 2:
+            return None
+        _, lat1, lon1 = self._track[-1]
+        for _, lat0, lon0 in reversed(self._track[:-1]):
+            if haversine_m(lat0, lon0, lat1, lon1) >= ROUTE_GPS_COURSE_M:
+                return bearing_deg(lat0, lon0, lat1, lon1)
+        return None
+
+    def _turn_in_place(self, degrees):
+        """Ter plaatse draaien (positief = rechts), op tijd zoals follow_heading.
+        Hoeft niet precies: daarna leren we de looprichting opnieuw."""
+        degrees = clamp(degrees, -180.0, 180.0)
+        duration = math.radians(abs(degrees)) / TURN_SPEED * TURN_CALIBRATION
+        z = -TURN_SPEED if degrees > 0 else TURN_SPEED     # positieve z is links
+        robot.note_command("draai %+.0f" % degrees)
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            if self._stop.is_set() or robot.stopped:
+                break
+            robot.move(x=0, y=0, z=z)
+            time.sleep(TURN_INTERVAL)
+        robot.move(x=0, y=0, z=0)
+
     # -- voor de webpagina ---------------------------------------------------
 
     def snapshot(self):
@@ -2292,6 +2463,7 @@ class RouteFollower:
             "active": self.active,
             "reason": self.reason,
             "changes": self.changes,
+            "mode": self.mode,
             "name": self.name,
             "point": min(self.index + 1, len(self.points)) if self.points else None,
             "points": len(self.points),
@@ -2623,6 +2795,10 @@ HTML_PAGE = """
     <select id="route-select"></select>
     <button id="route-go"><span class="ico">🗺️</span><span class="lbl">volg route</span></button>
   </div>
+  <label class="row">
+    <input type="checkbox" id="route-gps">
+    <span>GPS-modus: zonder camera recht naar elk punt (RTK nodig)</span>
+  </label>
   <div id="route-info">—</div>
 </section>
 
@@ -2848,7 +3024,9 @@ async function loadRoutes() {
 loadRoutes();
 
 routeGo.addEventListener('click', async () => {
-  const url = routeActive ? '/route/stop' : '/route/start?slug=' + encodeURIComponent(routeSelect.value);
+  const mode = document.getElementById('route-gps').checked ? 'gps' : 'path';
+  const url = routeActive ? '/route/stop'
+    : '/route/start?slug=' + encodeURIComponent(routeSelect.value) + '&mode=' + mode;
   if (!routeActive && !routeSelect.value) return;
   const res = await fetch(url, { method: 'POST' });
   const data = await res.json();
@@ -2861,9 +3039,10 @@ function showRoute(r) {
   routeGo.querySelector('.lbl').textContent = routeActive ? 'stop route' : 'volg route';
   routeGo.classList.toggle('bezig', routeActive);
   if (routeActive) {
-    routeInfo.textContent = r.name + ' — punt ' + r.point + '/' + r.points +
+    routeInfo.textContent = r.name + (r.mode === 'gps' ? ' (GPS-modus)' : '') +
+      ' — punt ' + r.point + '/' + r.points +
       (r.distance !== null ? ', nog ' + r.distance + ' m' : '') +
-      (r.accuracy ? ' (GPS ±' + Math.round(r.accuracy) + ' m)' : '');
+      (r.accuracy ? ' (GPS ±' + (r.accuracy < 1 ? r.accuracy.toFixed(2) : Math.round(r.accuracy)) + ' m)' : '');
   } else if (r.reason) {
     routeInfo.textContent = 'route gestopt: ' + r.reason;
   }
@@ -3533,10 +3712,14 @@ def route_paths():
 
 @app.route("/route/start", methods=["POST", "GET"])
 def route_start():
+    """Een route afleggen, bv. /route/start?slug=test-ehb&mode=gps
+
+    mode=path (standaard): de camera volgt het pad, de GPS telt de punten af.
+    mode=gps: rechtstreeks van punt naar punt op GPS, zonder camera (RTK nodig)."""
     slug = request.args.get("slug", "")
     if not slug:
         return jsonify({"ok": False, "error": "parameter 'slug' ontbreekt"}), 400
-    result = route_follower.start(slug)
+    result = route_follower.start(slug, request.args.get("mode", "path"))
     return jsonify(result), (200 if result.get("ok") else 409)
 
 

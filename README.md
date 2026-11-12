@@ -182,7 +182,7 @@ toe (`GUIDANCE_ORIGIN`).
 | `USE_CAMERA` | `1` | `0` = zonder robotcamera en YOLO |
 | `PAUSE_ROBOT_YOLO_FOR_PHONE` | `1` | Robot-YOLO pauzeren zolang de gsm beelden stuurt |
 | `GUIDANCE_ORIGIN` | `https://stayontrails.ehb.be` | Toegelaten site voor `/guidance` en `/segment` |
-| `FREEWALK_URL` | `https://localhost:5003` | Waar urlcontrol de routes en de GPS ophaalt |
+| `FREEWALK_URL` | `https://127.0.0.1:5003` | Waar urlcontrol de routes en de GPS ophaalt |
 | `FREEWALK_SIM_GPS` | `0` | freewalkFlask: GPS van de simulator in plaats van de gsm |
 
 ## Problemen oplossen
